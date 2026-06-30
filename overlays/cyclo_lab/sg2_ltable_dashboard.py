@@ -26,6 +26,8 @@ ROBOT_PROFILES: dict[str, dict[str, str]] = {
         "robot_type": "FFW_SG2",
         "vr_model": "sg2",
         "hand": "false",
+        # SG2 lift is controlled by the right thumbstick in the VR publisher.
+        "vr_extra_args": "",
         "urdf": (
             "/root/ros2_ws/install/ffw_description/share/ffw_description/urdf/"
             "ffw_sg2_rev1_follower/ffw_sg2_follower.urdf"
@@ -35,12 +37,20 @@ ROBOT_PROFILES: dict[str, dict[str, str]] = {
         "robot_type": "FFW_SH5",
         "vr_model": "sh5",
         "hand": "true",
+        # SH5 lift follows headset height (stand up / crouch). Head joint
+        # publishing stays OFF so the head camera stays on the task.
+        "vr_extra_args": "enable_lift_publishing:=true lift_control_mode:=head",
         "urdf": (
             "/root/ros2_ws/install/ffw_description/share/ffw_description/urdf/"
             "ffw_sh5_rev1_follower/ffw_sh5_follower.urdf"
         ),
     },
 }
+LIFT_ENABLED = os.environ.get("SH5_ENABLE_LIFT", "1") not in ("0", "false", "False")
+# Stereo passthrough image shown as the VR background. Off by default so the
+# headset shows a clean scene instead of the camera image. Set VR_IMAGE=1 to
+# re-enable the passthrough background.
+VR_IMAGE_ENABLED = os.environ.get("VR_IMAGE", "0") not in ("0", "false", "False")
 
 TASKS: dict[str, dict[str, str]] = {
     "L-Table Pick & Place (thin box)": {
@@ -104,7 +114,9 @@ _lock = threading.Lock()
 _logs: dict[str, list[str]] = {k: [] for k in ("cyclo", "vr", "ai", "recorder", "isaac")}
 _status: dict[str, str] = {k: "stopped" for k in _logs}
 _launch_ts: dict[str, float] = {}
+_active_teleop_robot: str | None = None
 STARTING_GRACE_S = 90.0
+TELEOP_WARMUP_S = 6.0
 
 
 def _log(key: str, msg: str) -> None:
@@ -131,9 +143,26 @@ def _set_task(label: str) -> bool:
     if label not in TASKS:
         return False
     with _lock:
+        prev_robot = TASKS.get(_selected_task, {}).get("robot")
         _selected_task = label
+        new_robot = TASKS[label]["robot"]
     _log("cyclo", f"task selected: {label} ({TASKS[label]['id']})")
+    if prev_robot and prev_robot != new_robot:
+        _log(
+            "cyclo",
+            f"robot changed {prev_robot} -> {new_robot}; "
+            "Launch Record will restart VR + controller for the new robot.",
+        )
     return True
+
+
+def _set_robot(robot: str) -> bool:
+    if robot not in ROBOT_PROFILES:
+        return False
+    for label, task in TASKS.items():
+        if task["robot"] == robot:
+            return _set_task(label)
+    return False
 
 
 def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str]:
@@ -212,8 +241,85 @@ def _current_robot_profile() -> dict[str, str]:
     return ROBOT_PROFILES.get(robot, ROBOT_PROFILES["FFW_SG2"])
 
 
+def _running_vr_model() -> str | None:
+    """Return 'sg2' or 'sh5' if a vr launch process is running, else None."""
+    code, out = _run(
+        [
+            "docker",
+            "exec",
+            VR_C,
+            "bash",
+            "-lc",
+            "ps aux 2>/dev/null | grep -E '[v]r.launch|[v]r_publisher' | head -5",
+        ]
+    )
+    if code != 0 or not out:
+        return None
+    if "model:=sh5" in out or "ffw_sh5" in out:
+        return "sh5"
+    if "model:=sg2" in out or "ffw_sg2" in out:
+        return "sg2"
+    return None
+
+
+def _running_ai_hand() -> str | None:
+    """Return 'true' or 'false' from the running motion-controller launch, else None."""
+    code, out = _run(
+        [
+            "docker",
+            "exec",
+            AI_C,
+            "bash",
+            "-lc",
+            "ps aux 2>/dev/null | grep -E '[a]i_worker_controller.launch|[v]r_controller_node' | head -5",
+        ]
+    )
+    if code != 0 or not out:
+        return None
+    if "hand:=true" in out:
+        return "true"
+    if "hand:=false" in out:
+        return "false"
+    return None
+
+
+def _teleop_stack_matches(profile: dict[str, str]) -> bool:
+    vr = _running_vr_model()
+    hand = _running_ai_hand()
+    if vr is None or hand is None:
+        return False
+    return vr == profile["vr_model"] and hand == profile["hand"]
+
+
+def ensure_teleop_stack() -> dict:
+    """Kill and relaunch VR + motion controller for the currently selected robot."""
+    global _active_teleop_robot
+    profile = _current_robot_profile()
+    task = _current_task()
+    _log(
+        "cyclo",
+        f"teleop stack -> {profile['robot_type']} "
+        f"(vr model={profile['vr_model']}, hand={profile['hand']}) for task: {task['label']}",
+    )
+    results: dict = {"profile": profile, "task": task["label"]}
+    ok_vr, msg_vr = launch_vr()
+    results["vr"] = {"ok": ok_vr, "msg": msg_vr}
+    time.sleep(2)
+    ok_ai, msg_ai = launch_ai_stack()
+    results["ai"] = {"ok": ok_ai, "msg": msg_ai}
+    if ok_vr and ok_ai:
+        with _lock:
+            _active_teleop_robot = profile["robot_type"]
+        time.sleep(TELEOP_WARMUP_S)
+    else:
+        with _lock:
+            _active_teleop_robot = None
+    return results
+
+
 def launch_ai_stack() -> tuple[bool, str]:
     profile = _current_robot_profile()
+    _log("ai", f"motion controller hand:={profile['hand']} ({profile['robot_type']})")
     _cleanup(AI_C, ["ros2_control_node", "robot_state_publisher",
                     "ai_worker_controller", "vr_controller_node", "retargeting"])
     cmd = (
@@ -230,17 +336,33 @@ def launch_ai_stack() -> tuple[bool, str]:
 
 def launch_vr() -> tuple[bool, str]:
     profile = _current_robot_profile()
-    _cleanup(VR_C, ["vr_publisher"])
+    extra = profile.get("vr_extra_args", "")
+    if profile["vr_model"] == "sh5" and not LIFT_ENABLED:
+        # Allow disabling lift via SH5_ENABLE_LIFT=0 (e.g. for stable manipulation).
+        extra = extra.replace("enable_lift_publishing:=true", "enable_lift_publishing:=false")
+    _log(
+        "vr",
+        f"VR launch model:={profile['vr_model']} ({profile['robot_type']})"
+        + (f" [{extra}]" if extra else ""),
+    )
+    _cleanup(VR_C, ["vr_publisher", "vr.launch"])
+    vr_image = "true" if VR_IMAGE_ENABLED else "false"
     cmd = (
         f"{ENV_ROS} && {ROS_SETUP} && "
-        f"ros2 launch robotis_vuer vr.launch.py model:={profile['vr_model']} enable_vr_image:=true"
+        f"ros2 launch robotis_vuer vr.launch.py model:={profile['vr_model']} "
+        f"enable_vr_image:={vr_image} {extra}".strip()
     )
     return _spawn("vr", VR_C, cmd)
 
 
-def launch_recorder() -> tuple[bool, str]:
+def launch_recorder(*, ensure_teleop: bool = True) -> tuple[bool, str]:
     task = _current_task()
     profile = _current_robot_profile()
+    if ensure_teleop:
+        teleop = ensure_teleop_stack()
+        if not teleop.get("vr", {}).get("ok") or not teleop.get("ai", {}).get("ok"):
+            _log("recorder", "aborted: teleop stack failed to start for selected robot")
+            return False, "teleop stack failed; see vr/ai logs"
     ds = f"{REPO_IN}/datasets/{task['dataset']}"
     _log("recorder", f"task: {task['label']} -> {task['id']} ({profile['robot_type']})")
     cmd = (
@@ -275,12 +397,25 @@ def kill_isaac() -> tuple[bool, str]:
 def launch_all() -> dict:
     out: dict = {"containers": launch_containers()}
     time.sleep(3)
-    for fn, label in [(launch_vr, "vr"), (launch_ai_stack, "ai")]:
-        ok, msg = fn()
-        out[label] = {"ok": ok, "msg": msg}
-        time.sleep(2)
+    out["teleop"] = ensure_teleop_stack()
     out["vuer_url"] = f"https://{_host_ip()}:8012"
-    out["note"] = "Start recorder separately after Isaac is up."
+    profile = _current_robot_profile()
+    out["note"] = (
+        f"VR + controller running for {profile['robot_type']} "
+        f"(model={profile['vr_model']}, hand={profile['hand']}). "
+        "Use Launch Record to start Isaac with the matching stack."
+    )
+    return out
+
+
+def launch_record() -> dict:
+    """Ensure containers, correct VR/AI for selected robot, then start Isaac recorder."""
+    out: dict = {"containers": launch_containers()}
+    time.sleep(3)
+    out["teleop"] = ensure_teleop_stack()
+    ok, msg = launch_recorder(ensure_teleop=False)
+    out["recorder"] = {"ok": ok, "msg": msg}
+    out["vuer_url"] = f"https://{_host_ip()}:8012"
     return out
 
 
@@ -320,6 +455,10 @@ def snapshot() -> dict:
         st = dict(_status)
         logs_tail = {k: v[-30:] for k, v in _logs.items()}
     task = _current_task()
+    profile = _current_robot_profile()
+    vr_running = _running_vr_model()
+    hand_running = _running_ai_hand()
+    teleop_ok = _teleop_stack_matches(profile)
     return {
         "containers": containers,
         "status": st,
@@ -328,7 +467,17 @@ def snapshot() -> dict:
         "task": task["id"],
         "task_label": task["label"],
         "robot": task.get("robot", "FFW_SG2"),
+        "robot_label": "Gripper (SG2)" if task.get("robot") == "FFW_SG2" else "Hands (SH5)",
+        "vr_model": profile["vr_model"],
+        "hand": profile["hand"],
+        "teleop_matches_task": teleop_ok,
+        "running_vr_model": vr_running,
+        "running_ai_hand": hand_running,
         "tasks": list(TASKS.keys()),
+        "tasks_by_robot": {
+            robot: [label for label, t in TASKS.items() if t["robot"] == robot]
+            for robot in ROBOT_PROFILES
+        },
         "logs": logs_tail,
     }
 
@@ -352,22 +501,32 @@ select{background:#0a0c10;color:#e8eaed;border:1px solid #2a2f3d;border-radius:6
 pre{background:#0a0c10;padding:.75rem;border-radius:8px;overflow:auto;max-height:220px;font-size:.75rem}
 a{color:#60a5fa}
 </style></head><body>
-<header><h1>FFW-SG2 L-Table VR + Recorder</h1></header>
+<header><h1>FFW VR + Recorder Dashboard</h1></header>
 <main>
 <div class="row">
+<label class="tag">Robot:
+<select id="robot" onchange="setRobot()">
+<option value="FFW_SG2">Gripper (SG2)</option>
+<option value="FFW_SH5">Hands (SH5)</option>
+</select>
+</label>
 <label class="tag">Task:
 <select id="task" onchange="setTask()"></select>
 </label>
 </div>
 <div class="row">
-<button class="primary" onclick="act('launch_all')">Launch All Servers</button>
-<button class="secondary" onclick="act('launch_recorder')">Start Recorder (Isaac)</button>
+<button class="primary" onclick="act('launch_all')">Launch VR + Controller</button>
+<button class="primary" onclick="act('launch_record')">Launch Record</button>
+<button class="secondary" onclick="act('launch_recorder')">Isaac Only</button>
 <button class="danger" onclick="act('kill_isaac')">Kill Isaac</button>
 <button class="secondary" onclick="refresh()">Refresh</button>
 </div>
 <div class="card"><div id="meta"></div><div class="grid" id="status"></div></div>
 <div class="card"><h3>Logs</h3><pre id="logs"></pre></div>
-<p>VR: accept cert at Vuer URL. SG2: squeeze both grips to teleop. SH5: use hand gesture to toggle (see <a href="https://docs.robotis.com/docs/systems/aiworker/quick_start_guide/operation_guide/vr_teleoperation" target="_blank">ROBOTIS VR docs</a>). B=record, L=face target table, N=save, R=reset.</p>
+<p><b>Launch Record</b> restarts VR + motion controller for the selected robot, then starts Isaac.
+Gripper tasks use <code>model:=sg2 hand:=false</code>; hand tasks use <code>model:=sh5 hand:=true</code>.
+VR: accept cert at Vuer URL. SG2: squeeze both grips. SH5: hand gesture to toggle publishing.
+B=record, L=face target table, N=save, R=reset.</p>
 </main>
 <script>
 async function act(a){await fetch('/api/'+a,{method:'POST'});refresh()}
@@ -376,15 +535,35 @@ async function setTask(){
  await fetch('/api/set_task',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task:label})});
  refresh();
 }
+async function setRobot(){
+ const robot=document.getElementById('robot').value;
+ await fetch('/api/set_robot',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({robot})});
+ refresh();
+}
+function fillTaskOptions(d){
+ const sel=document.getElementById('task');
+ const robot=document.getElementById('robot').value;
+ const tasks=(d.tasks_by_robot&&d.tasks_by_robot[robot])||d.tasks;
+ sel.innerHTML='';
+ tasks.forEach(t=>{const o=document.createElement('option');o.value=t;o.textContent=t;sel.appendChild(o);});
+ if(tasks.includes(d.task_label)) sel.value=d.task_label;
+ else if(tasks.length) sel.value=tasks[0];
+}
 async function refresh(){
  const d=await(await fetch('/api/status')).json();
+ const robotSel=document.getElementById('robot');
+ if(document.activeElement!==robotSel) robotSel.value=d.robot;
+ fillTaskOptions(d);
  const sel=document.getElementById('task');
- if(sel.options.length!==d.tasks.length){
-  sel.innerHTML='';
-  d.tasks.forEach(t=>{const o=document.createElement('option');o.value=t;o.textContent=t;sel.appendChild(o);});
- }
  if(document.activeElement!==sel) sel.value=d.task_label;
- let h='<p>Task: <b>'+d.task_label+'</b> <span class="tag">'+d.task+'</span><br>Robot: <b>'+d.robot+'</b><br>Vuer: <a href="'+d.vuer_url+'" target="_blank">'+d.vuer_url+'</a> ('+d.vuer_ws+')</p>';
+ const teleopCls=d.teleop_matches_task?'ok':'bad';
+ const teleopTxt=d.teleop_matches_task?'matches task':'will restart on Launch Record';
+ let h='<p>Robot: <b>'+d.robot_label+'</b> <span class="tag">'+d.robot+'</span><br>';
+ h+='Task: <b>'+d.task_label+'</b> <span class="tag">'+d.task+'</span><br>';
+ h+='Expected teleop: <span class="tag">vr model='+d.vr_model+', hand='+d.hand+'</span><br>';
+ h+='Running teleop: <span class="tag">vr='+(d.running_vr_model||'none')+', hand='+(d.running_ai_hand||'none')+'</span> ';
+ h+='<span class="'+teleopCls+'">('+teleopTxt+')</span><br>';
+ h+='Vuer: <a href="'+d.vuer_url+'" target="_blank">'+d.vuer_url+'</a> ('+d.vuer_ws+')</p>';
  document.getElementById('meta').innerHTML=h;
  let s='';
  for(const[k,v]of Object.entries(d.containers))s+='<div class="tag">'+k+': <span class="'+(v?'ok':'bad')+'">'+(v?'up':'down')+'</span></div>';
@@ -430,6 +609,10 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=launch_all, daemon=True).start()
             self._json(200, {"ok": True, "msg": "launch started"})
             return
+        if path == "/api/launch_record":
+            threading.Thread(target=launch_record, daemon=True).start()
+            self._json(200, {"ok": True, "msg": "launch record started"})
+            return
         if path == "/api/launch_recorder":
             ok, msg = launch_recorder()
             self._json(200, {"ok": ok, "msg": msg})
@@ -445,6 +628,15 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 body = {}
             ok = _set_task(body.get("task", ""))
+            self._json(200 if ok else 400, {"ok": ok, "task": _current_task()})
+            return
+        if path == "/api/set_robot":
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                body = {}
+            ok = _set_robot(body.get("robot", ""))
             self._json(200 if ok else 400, {"ok": ok, "task": _current_task()})
             return
         self._json(404, {"error": "not found"})

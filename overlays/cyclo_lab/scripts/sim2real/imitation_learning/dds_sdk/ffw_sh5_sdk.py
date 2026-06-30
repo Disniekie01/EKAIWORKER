@@ -83,6 +83,8 @@ class FFWSH5Sdk(FFWSG2Sdk):
         self.left_hand_thread.start()
         self.right_hand_thread.start()
         print(f"[SH5] Hand DDS topics: {LEFT_HAND_TOPIC}, {RIGHT_HAND_TOPIC}")
+        if getattr(self.env.cfg, "teleop_l_use_swerve", True):
+            self._init_swerve_drive()
         self._keyboard_controls()
 
     def _resolve_action_joint_order(self) -> list:
@@ -167,12 +169,17 @@ class FFWSH5Sdk(FFWSG2Sdk):
 
     def _keyboard_controls(self):
         print("\n[Control] Press keys to control the FFW-SH5 robot:")
+        l_motion = (
+            "swerve-drive rotate + forward"
+            if self._use_swerve_l_motion and self._swerve_controller is not None
+            else "smooth rotate + forward (root teleport)"
+        )
         if self.mode == "record":
             print("[N / Right Joystick Button] Save successful episode and proceed to the next one")
             print("[R / Left Joystick Button] Skip failed episode (not saved) and proceed to the next one")
             print("[B / Right Joystick Button] Start recording the current episode")
-            print(f"[L] Smoothly rotate robot to face the {self._l_motion_label}, then move forward")
+            print(f"[L] {l_motion} toward the {self._l_motion_label}")
         elif self.mode == "inference":
             print("[R] Skip failed episode (not saved) and proceed to the next one")
             print("[B] Start robot control")
-            print(f"[L] Smoothly rotate robot to face the {self._l_motion_label}, then move forward")
+            print(f"[L] {l_motion} toward the {self._l_motion_label}")

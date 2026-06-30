@@ -80,6 +80,18 @@ class FFWSG2Sdk:
         self._box_rel_pos = None  # (1, 3) box pos in root frame
         self._box_rel_quat = None  # (1, 4) box quat in root frame
         self._box_asset_name = "cardboard_box"
+        # Swerve-drive L-motion (SH5): uses cmd_vel-style base motion instead of root teleport.
+        self._use_swerve_l_motion = False
+        self._swerve_controller = None
+        self._swerve_phase = None
+        self._swerve_steering_joint_ids: list[int] = []
+        self._swerve_wheel_joint_ids: list[int] = []
+        self._swerve_forward_start_xy = None
+        self._swerve_forward_dir_xy = None
+        self._last_swerve_update_time = time.monotonic()
+        self._swerve_yaw_tol = 0.08
+        self._swerve_max_angular_z = 0.6
+        self._swerve_max_linear_x = 0.25
         self.lock = threading.Lock()  # Protect shared state
 
         # Initialize current joint state - will be updated only when commands are received
@@ -174,6 +186,7 @@ class FFWSG2Sdk:
             getattr(cfg, "teleop_l_rotation_duration_s", self._rotation_duration_s)
         )
         self._l_motion_label = str(getattr(cfg, "teleop_l_target_label", self._l_motion_label))
+        self._use_swerve_l_motion = bool(getattr(cfg, "teleop_l_use_swerve", self._use_swerve_l_motion))
 
     # ----------------------
     # Keyboard controls
@@ -531,8 +544,11 @@ class FFWSG2Sdk:
             self._restore_home_pose()
         elif pending_face_left:
             self.face_left_table()
-        self._step_yaw_rotation()
-        self._step_forward_motion()
+        if self._use_swerve_l_motion and self._swerve_controller is not None:
+            self._step_swerve_l_motion()
+        else:
+            self._step_yaw_rotation()
+            self._step_forward_motion()
         self._publish_joint_states()
         self._publish_camera("cam_head")
         # self._publish_camera("cam_wrist_right")
@@ -565,10 +581,14 @@ class FFWSG2Sdk:
         self._forward_active = False
         self._pending_reset_pose = False
         self._carry_box = False
+        self._swerve_phase = None
 
     def _restore_home_pose(self):
         """Restore the robot root pose (position + orientation) to its home/start
         pose, undoing any rotation/translation applied by the L (face-left) action."""
+        self._swerve_phase = None
+        if self._swerve_controller is not None:
+            self._apply_swerve_cmd_vel(0.0, 0.0, 0.0)
         if self._home_root_pose is None:
             return
         robot = self.env.scene["robot"]
@@ -581,6 +601,18 @@ class FFWSG2Sdk:
 
     def face_left_table(self):
         """Begin a smooth rotation toward the task target, then move forward."""
+        if self._use_swerve_l_motion and self._swerve_controller is not None:
+            self._forward_active = False
+            self._rotation_active = False
+            self._swerve_phase = "rotate"
+            self._rotation_target_yaw = self._face_left_yaw
+            self._swerve_forward_start_xy = None
+            self._swerve_forward_dir_xy = None
+            print(
+                f"[Control] Swerve: rotating to face the {self._l_motion_label}, "
+                f"then driving forward {self._forward_distance_m:.2f} m"
+            )
+            return
         self._forward_active = False
         self._capture_box_carry()
         self._begin_yaw_rotation(self._face_left_yaw)
@@ -704,6 +736,189 @@ class FFWSG2Sdk:
             self._forward_active = False
             self._carry_box = False
             print(f"[Control] Robot finished moving forward toward the {self._l_motion_label}")
+
+    def _init_swerve_drive(self) -> None:
+        """Set up the SH5 swerve controller (same stack as sh5_dds_bringup)."""
+        import sys
+        from pathlib import Path
+
+        bringup_dir = Path(__file__).resolve().parents[2] / "bringup"
+        if str(bringup_dir) not in sys.path:
+            sys.path.insert(0, str(bringup_dir))
+
+        from common import robotis_config as bringup_cfg
+        from common.swerve_drive import SwerveDriveController, SwerveModule
+        from cyclo_lab.assets.robots.FFW_SH5 import (
+            SH5_SWERVE_MODULE_ANGLE_OFFSETS,
+            SH5_SWERVE_MODULE_X_OFFSETS,
+            SH5_SWERVE_MODULE_Y_OFFSETS,
+            SH5_SWERVE_STEERING_JOINTS,
+            SH5_SWERVE_WHEEL_JOINTS,
+            SH5_SWERVE_WHEEL_RADIUS,
+        )
+
+        robot = self.env.scene["robot"]
+        joint_names = list(robot.data.joint_names)
+        name_to_id = {name: idx for idx, name in enumerate(joint_names)}
+
+        modules = [
+            SwerveModule(
+                steering_joint=steering_joint,
+                wheel_joint=wheel_joint,
+                x_offset=SH5_SWERVE_MODULE_X_OFFSETS[index],
+                y_offset=SH5_SWERVE_MODULE_Y_OFFSETS[index],
+                angle_offset=SH5_SWERVE_MODULE_ANGLE_OFFSETS[index],
+                steering_limit_lower=bringup_cfg.AI_WORKER_SWERVE_STEERING_LIMIT_LOWER,
+                steering_limit_upper=bringup_cfg.AI_WORKER_SWERVE_STEERING_LIMIT_UPPER,
+                wheel_speed_limit_lower=bringup_cfg.AI_WORKER_SWERVE_WHEEL_SPEED_LIMIT_LOWER,
+                wheel_speed_limit_upper=bringup_cfg.AI_WORKER_SWERVE_WHEEL_SPEED_LIMIT_UPPER,
+            )
+            for index, (steering_joint, wheel_joint) in enumerate(
+                zip(SH5_SWERVE_STEERING_JOINTS, SH5_SWERVE_WHEEL_JOINTS)
+            )
+        ]
+
+        missing = [
+            joint
+            for module in modules
+            for joint in (module.steering_joint, module.wheel_joint)
+            if joint not in name_to_id
+        ]
+        if missing:
+            print(f"[SH5] Swerve joints missing from articulation {missing}; L-motion uses root teleport.")
+            self._use_swerve_l_motion = False
+            return
+
+        self._swerve_steering_joint_ids = [name_to_id[m.steering_joint] for m in modules]
+        self._swerve_wheel_joint_ids = [name_to_id[m.wheel_joint] for m in modules]
+        self._swerve_controller = SwerveDriveController(modules, SH5_SWERVE_WHEEL_RADIUS)
+        self._use_swerve_l_motion = True
+        print("[SH5] Swerve-drive L-motion enabled (cmd_vel-style base control).")
+
+    def _yaw_error(self, target_yaw: float) -> float:
+        current = self._get_robot_yaw()
+        return (target_yaw - current + math.pi) % (2.0 * math.pi) - math.pi
+
+    def _apply_swerve_cmd_vel(self, linear_x: float, linear_y: float, angular_z: float) -> None:
+        if self._swerve_controller is None:
+            return
+
+        robot = self.env.scene["robot"]
+        now = time.monotonic()
+        dt = max(now - self._last_swerve_update_time, 1.0e-3)
+        self._last_swerve_update_time = now
+
+        current_steering = [
+            float(v)
+            for v in robot.data.joint_pos[0, self._swerve_steering_joint_ids].detach().cpu().tolist()
+        ]
+        current_wheel_velocities = [
+            float(v)
+            for v in robot.data.joint_vel[0, self._swerve_wheel_joint_ids].detach().cpu().tolist()
+        ]
+
+        module_commands = self._swerve_controller.compute_commands(
+            linear_x,
+            linear_y,
+            angular_z,
+            current_steering_positions=current_steering,
+            current_wheel_velocities=current_wheel_velocities,
+            dt=dt,
+        )
+
+        position_target = robot.data.joint_pos_target.clone()
+        velocity_target = robot.data.joint_vel_target.clone()
+        for module_command, steering_id, wheel_id in zip(
+            module_commands,
+            self._swerve_steering_joint_ids,
+            self._swerve_wheel_joint_ids,
+        ):
+            position_target[:, steering_id] = module_command.steering_position
+            velocity_target[:, wheel_id] = module_command.wheel_velocity
+        robot.set_joint_position_target(position_target)
+        robot.set_joint_velocity_target(velocity_target)
+
+        # The recording env spawns the SH5 with gravity disabled, so the wheels
+        # spin without ground traction and the base would never move from
+        # friction alone. Integrate the commanded body twist into the root pose
+        # so the base actually drives, while the steering/wheel joint targets
+        # above still produce realistic swerve values in the recorded dataset.
+        if (
+            abs(linear_x) > 1.0e-4
+            or abs(linear_y) > 1.0e-4
+            or abs(angular_z) > 1.0e-4
+        ):
+            self._integrate_swerve_root(linear_x, linear_y, angular_z, dt)
+
+    def _integrate_swerve_root(
+        self, linear_x: float, linear_y: float, angular_z: float, dt: float
+    ) -> None:
+        robot = self.env.scene["robot"]
+        device = self.env.device
+        env_ids = torch.tensor([0], device=device)
+
+        yaw = self._get_robot_yaw()
+        new_yaw = yaw + angular_z * dt
+        cos_y, sin_y = math.cos(yaw), math.sin(yaw)
+        dx = (linear_x * cos_y - linear_y * sin_y) * dt
+        dy = (linear_x * sin_y + linear_y * cos_y) * dt
+
+        pos = robot.data.root_pos_w[0:1].clone()
+        pos[0, 0] += dx
+        pos[0, 1] += dy
+        quat = math_utils.quat_from_euler_xyz(
+            torch.zeros(1, device=device),
+            torch.zeros(1, device=device),
+            torch.tensor([new_yaw], device=device),
+        )
+        root_pose = torch.cat([pos, quat], dim=-1)
+        robot.write_root_pose_to_sim(root_pose, env_ids=env_ids)
+        robot.write_root_velocity_to_sim(torch.zeros(1, 6, device=device), env_ids=env_ids)
+        self._carry_box_with_root()
+
+    def _step_swerve_l_motion(self) -> None:
+        if self._swerve_phase is None:
+            self._apply_swerve_cmd_vel(0.0, 0.0, 0.0)
+            return
+
+        if self._swerve_phase == "rotate":
+            yaw_err = self._yaw_error(self._rotation_target_yaw)
+            if abs(yaw_err) < self._swerve_yaw_tol:
+                self._swerve_phase = "forward"
+                robot = self.env.scene["robot"]
+                pos = robot.data.root_pos_w[0].detach().cpu().tolist()
+                yaw = self._get_robot_yaw()
+                self._swerve_forward_start_xy = (pos[0], pos[1])
+                self._swerve_forward_dir_xy = (math.cos(yaw), math.sin(yaw))
+                print(f"[Control] Swerve: rotation done; driving toward the {self._l_motion_label}")
+                return
+
+            angular_z = max(
+                -self._swerve_max_angular_z,
+                min(self._swerve_max_angular_z, 2.5 * yaw_err),
+            )
+            self._apply_swerve_cmd_vel(0.0, 0.0, angular_z)
+            return
+
+        if self._swerve_phase == "forward":
+            robot = self.env.scene["robot"]
+            pos = robot.data.root_pos_w[0].detach().cpu().tolist()
+            if self._swerve_forward_start_xy is None or self._swerve_forward_dir_xy is None:
+                self._swerve_phase = None
+                self._apply_swerve_cmd_vel(0.0, 0.0, 0.0)
+                return
+
+            dx = pos[0] - self._swerve_forward_start_xy[0]
+            dy = pos[1] - self._swerve_forward_start_xy[1]
+            traveled = dx * self._swerve_forward_dir_xy[0] + dy * self._swerve_forward_dir_xy[1]
+            if traveled >= self._forward_distance_m:
+                self._swerve_phase = None
+                self._apply_swerve_cmd_vel(0.0, 0.0, 0.0)
+                print(f"[Control] Swerve: finished driving toward the {self._l_motion_label}")
+                return
+
+            linear_x = min(self._swerve_max_linear_x, max(0.05, 0.5 * (self._forward_distance_m - traveled)))
+            self._apply_swerve_cmd_vel(linear_x, 0.0, 0.0)
 
     def add_callback(self, key: str, func: Callable):
         """Add callback function for a specific key."""
