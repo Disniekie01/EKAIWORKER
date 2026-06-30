@@ -1,6 +1,6 @@
 {
-  "name": "EYKAIWORKER",
-  "description": "Portable overlay for EYKOREA Isaac Sim VR teleoperation tasks.",
+  "name": "AIWORKER",
+  "description": "Portable overlay for AI Worker Isaac Sim VR teleoperation tasks.",
   "upstreams": {
     "cyclo_lab": {
       "url": "https://github.com/ROBOTIS-GIT/cyclo_lab.git",

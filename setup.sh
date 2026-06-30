@@ -21,7 +21,7 @@ clone_or_update() {
   git -C "$dir" checkout "$commit"
 }
 
-echo "Installing EYKAIWORKER into: $INSTALL_DIR"
+echo "Installing AIWORKER into: $INSTALL_DIR"
 mkdir -p "$INSTALL_DIR"
 
 clone_or_update "https://github.com/ROBOTIS-GIT/cyclo_lab.git" "$INSTALL_DIR/cyclo_lab" "$CYCLO_LAB_COMMIT"
@@ -31,7 +31,7 @@ clone_or_update "https://github.com/ROBOTIS-GIT/robotis_applications.git" "$INST
 echo "Updating cyclo_lab submodules..."
 git -C "$INSTALL_DIR/cyclo_lab" submodule update --init --recursive
 
-echo "Applying EYKAIWORKER overlay..."
+echo "Applying AIWORKER overlay..."
 rsync -a "$ROOT_DIR/overlays/cyclo_lab/" "$INSTALL_DIR/cyclo_lab/"
 rsync -a "$ROOT_DIR/overlays/robotis_applications/" "$INSTALL_DIR/robotis_applications/"
 

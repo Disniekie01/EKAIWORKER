@@ -1,8 +1,8 @@
-# EYKAIWORKER
+# AIWORKER
 
-Portable overlay for the EYKOREA Isaac Sim VR teleoperation tasks.
+Portable overlay for AI Worker Isaac Sim VR teleoperation tasks.
 
-This repo is intentionally small. It does not vendor the full ROBOTIS repositories and it does not include recorded datasets. Instead, `setup.sh` clones the required upstream repos at pinned commits, initializes `cyclo_lab` submodules, and copies the EYKAIWORKER overlay files on top.
+This repo is intentionally small. It does not vendor the full ROBOTIS repositories and it does not include recorded datasets. Instead, `setup.sh` clones the required upstream repos at pinned commits, initializes `cyclo_lab` submodules, and copies the AIWORKER overlay files on top.
 
 ## What This Adds
 
@@ -22,15 +22,15 @@ This repo is intentionally small. It does not vendor the full ROBOTIS repositori
 ## Install On A New Machine
 
 ```bash
-git clone <this-repo-url> EYKAIWORKER
-cd EYKAIWORKER
-./setup.sh ~/EYKOREA
+git clone https://github.com/Disniekie01/EKAIWORKER.git AIWORKER
+cd AIWORKER
+./setup.sh ~/AIWORKER
 ```
 
 The install directory can be any path. The command above creates:
 
 ```text
-~/EYKOREA/
+~/AIWORKER/
   cyclo_lab/
   ai_worker/
   robotis_applications/
@@ -39,20 +39,20 @@ The install directory can be any path. The command above creates:
 ## Start Containers
 
 ```bash
-cd ~/EYKOREA/cyclo_lab/docker
+cd ~/AIWORKER/cyclo_lab/docker
 ./container.sh start
 
-cd ~/EYKOREA/robotis_applications/docker
+cd ~/AIWORKER/robotis_applications/docker
 ./container.sh start
 
-cd ~/EYKOREA/ai_worker/docker
+cd ~/AIWORKER/ai_worker/docker
 ./container.sh start
 ```
 
 ## Start Dashboard
 
 ```bash
-cd ~/EYKOREA/cyclo_lab
+cd ~/AIWORKER/cyclo_lab
 python3 sg2_ltable_dashboard.py
 ```
 
