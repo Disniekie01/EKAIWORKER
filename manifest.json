@@ -1,0 +1,23 @@
+{
+  "name": "EYKAIWORKER",
+  "description": "Portable overlay for EYKOREA Isaac Sim VR teleoperation tasks.",
+  "upstreams": {
+    "cyclo_lab": {
+      "url": "https://github.com/ROBOTIS-GIT/cyclo_lab.git",
+      "commit": "85b237bf22068da18999bacbda5652f201594d11"
+    },
+    "ai_worker": {
+      "url": "https://github.com/ROBOTIS-GIT/ai_worker.git",
+      "commit": "e8c2eacb612e47473cdf03e44bee6d527c00b4f9"
+    },
+    "robotis_applications": {
+      "url": "https://github.com/ROBOTIS-GIT/robotis_applications.git",
+      "commit": "7ef0aabc748174cb91013866b2e4142122ef475c"
+    }
+  },
+  "datasets": "excluded",
+  "overlay_dirs": [
+    "overlays/cyclo_lab",
+    "overlays/robotis_applications"
+  ]
+}
