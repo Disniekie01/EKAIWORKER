@@ -1,0 +1,23 @@
+# Copyright (c) 2024, Cyclo Lab Project Developers.
+# All rights reserved.
+#
+# Based on Isaac Lab x11.yaml
+
+services:
+  cyclo_lab:
+    environment:
+      - DISPLAY
+      - TERM
+      - QT_X11_NO_MITSHM=1
+      - XAUTHORITY=${__CYCLOLAB_TMP_XAUTH}
+    volumes:
+    - type: bind
+      source: ${__CYCLOLAB_TMP_DIR}
+      target: ${__CYCLOLAB_TMP_DIR}
+    - type: bind
+      source: /tmp/.X11-unix
+      target: /tmp/.X11-unix
+    - type: bind
+      source: /etc/localtime
+      target: /etc/localtime
+      read_only: true

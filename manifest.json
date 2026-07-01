@@ -1,6 +1,6 @@
 {
   "name": "AIWORKER",
-  "description": "Portable overlay for AI Worker Isaac Sim VR teleoperation tasks.",
+  "description": "Portable overlay for AI Worker Isaac Sim VR teleoperation tasks. Local teleop fixes live in overlays/; upstream commits are bootstrap pins only.",
   "upstreams": {
     "cyclo_lab": {
       "url": "https://github.com/ROBOTIS-GIT/cyclo_lab.git",

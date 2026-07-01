@@ -118,6 +118,8 @@ class ObservationsCfg:
                 "left_eef_cfg": SceneEntityCfg("left_eef"),
                 "right_eef_cfg": SceneEntityCfg("right_eef"),
                 "object_cfg": SceneEntityCfg("cardboard_box"),
+                "diff_threshold": 0.20,
+                "finger_close_threshold": 0.12,
             },
         )
         box_on_left_table = ObsTerm(
@@ -159,7 +161,7 @@ class TerminationsCfg:
 
 @configclass
 class BoxStackSH5EnvCfg(ManagerBasedRLEnvCfg):
-    """Dual-gripper thick-box pick from front table and place on left table."""
+    """Dual-hand thick-box pick from front table and place on left table."""
 
     scene: BoxStackSceneCfg = BoxStackSceneCfg(num_envs=4096, env_spacing=3.0, replicate_physics=False)
     observations: ObservationsCfg = ObservationsCfg()
@@ -172,7 +174,13 @@ class BoxStackSH5EnvCfg(ManagerBasedRLEnvCfg):
     events = None
     curriculum = None
 
-    teleop_l_use_swerve: bool = True
+    teleop_l_use_swerve: bool = False
+    teleop_auto_l_on_grip_s: float = 2.0
+    teleop_lift_min: float = -0.40
+    teleop_lift_max: float = 0.0
+    teleop_sh5_finger_hold_alpha: float = 0.42
+    teleop_sh5_finger_hold_alpha_firm: float = 0.68
+    teleop_sh5_finger_hold_alpha_carry: float = 0.82
 
     def __post_init__(self):
         self.decimation = 5

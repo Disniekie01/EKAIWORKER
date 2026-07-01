@@ -55,8 +55,14 @@ RISER_CENTER_Z = TABLE_HEIGHT + RISER_HEIGHT / 2.0
 # When placed on the (bare, no-riser) left table, the box rests directly on the
 # surface. The drop zone uses this height, not the raised front-table BOX_TOP_Z.
 BOX_ON_TABLE_Z = TABLE_HEIGHT + BOX_HALF_HEIGHT
-# Target drop zone: on the left table surface near the L-corner (reachable).
-LEFT_TABLE_DROP_ZONE = (0.55, 0.70, BOX_ON_TABLE_Z)
+# Left table tabletop half-extents (matches TableWithLegsCfg depth=0.6, width=1.1).
+LEFT_TABLE_HALF_DEPTH = 0.30
+LEFT_TABLE_HALF_WIDTH = 0.55
+# Inset from the table rim for success + marker (keeps box fully on surface).
+LEFT_TABLE_EDGE_MARGIN = 0.05
+LEFT_TABLE_DROP_HEIGHT_TOLERANCE = 0.06
+# Yaw 90° about Z for left-table root orientation (w, x, y, z).
+LEFT_TABLE_QUAT_WXYZ = (0.70710678, 0.0, 0.0, 0.70710678)
 
 
 def _write_pose(env: ManagerBasedEnv, asset, cur_env: int, pos_xyz, yaw: float = 0.0):
@@ -111,11 +117,26 @@ def randomize_l_table_scene(
         _write_pose(env, box, cur_env, box_pos, yaw=dyaw)
 
 
-def get_left_table_drop_zone_world(
+def is_object_on_left_table_top(
     env: ManagerBasedEnv,
-    table_left_cfg: SceneEntityCfg | None = None,
+    object_cfg: SceneEntityCfg,
+    table_left_cfg: SceneEntityCfg,
+    edge_margin: float = LEFT_TABLE_EDGE_MARGIN,
+    height_tolerance: float = LEFT_TABLE_DROP_HEIGHT_TOLERANCE,
 ) -> torch.Tensor:
-    """World-frame drop zone position on the left table for each env."""
-    num_envs = env.scene.env_origins.shape[0]
-    rel = torch.tensor([list(LEFT_TABLE_DROP_ZONE)], device=env.device).expand(num_envs, -1)
-    return env.scene.env_origins[:, 0:3] + rel
+    """True when the object center is on the left table tabletop (TableLeft/geometry/tabletop)."""
+    obj = env.scene[object_cfg.name]
+    table = env.scene[table_left_cfg.name]
+    rel_local = math_utils.quat_apply(
+        math_utils.quat_inv(table.data.root_quat_w),
+        obj.data.root_pos_w - table.data.root_pos_w,
+    )
+    half_x = LEFT_TABLE_HALF_DEPTH - edge_margin
+    half_y = LEFT_TABLE_HALF_WIDTH - edge_margin
+    xy_ok = torch.logical_and(
+        torch.abs(rel_local[:, 0]) <= half_x,
+        torch.abs(rel_local[:, 1]) <= half_y,
+    )
+    target_z = TABLE_HEIGHT + BOX_HALF_HEIGHT
+    z_ok = torch.abs(rel_local[:, 2] - target_z) < height_tolerance
+    return torch.logical_and(xy_ok, z_ok)

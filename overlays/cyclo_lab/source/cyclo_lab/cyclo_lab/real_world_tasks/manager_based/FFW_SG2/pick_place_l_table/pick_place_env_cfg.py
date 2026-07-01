@@ -31,6 +31,7 @@ from isaaclab.utils import configclass
 from isaaclab.sensors import CameraCfg
 
 from . import mdp
+from .mdp.ffw_sg2_l_table_events import LEFT_TABLE_DROP_HEIGHT_TOLERANCE, LEFT_TABLE_EDGE_MARGIN
 
 
 @configclass
@@ -45,6 +46,7 @@ class LTableSceneCfg(InteractiveSceneCfg):
     table_left: AssetBaseCfg = MISSING
     cardboard_box: AssetBaseCfg = MISSING
     box_riser: AssetBaseCfg = MISSING
+    drop_zone_marker: AssetBaseCfg | None = None
     cam_head: CameraCfg = MISSING
 
     plane = AssetBaseCfg(
@@ -133,7 +135,8 @@ class ObservationsCfg:
             params={
                 "object_cfg": SceneEntityCfg("cardboard_box"),
                 "table_left_cfg": SceneEntityCfg("table_left"),
-                "distance_threshold": 0.12,
+                "edge_margin": LEFT_TABLE_EDGE_MARGIN,
+                "height_tolerance": LEFT_TABLE_DROP_HEIGHT_TOLERANCE,
             },
         )
 
@@ -153,7 +156,8 @@ class TerminationsCfg:
         params={
             "object_cfg": SceneEntityCfg("cardboard_box"),
             "table_left_cfg": SceneEntityCfg("table_left"),
-            "distance_threshold": 0.12,
+            "edge_margin": LEFT_TABLE_EDGE_MARGIN,
+            "height_tolerance": LEFT_TABLE_DROP_HEIGHT_TOLERANCE,
         },
     )
     object_dropped = DoneTerm(
@@ -180,6 +184,8 @@ class PickPlaceLTableEnvCfg(ManagerBasedRLEnvCfg):
     events = None
     curriculum = None
 
+    teleop_l_use_swerve: bool = False
+    teleop_auto_l_on_grip_s: float = 2.0
     def __post_init__(self):
         self.decimation = 5
         self.episode_length_s = 45.0

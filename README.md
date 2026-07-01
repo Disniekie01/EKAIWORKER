@@ -7,8 +7,8 @@ This repo is intentionally small. It does not vendor the full ROBOTIS repositori
 ## What This Adds
 
 - `cyclo_lab` dashboard for launching the stack and selecting tasks.
-- SG2 L-table, box-stack, single-box-far, and thick-box variants.
-- SH5 hand versions of the same tasks.
+- SG2 basket pick-place, L-table, box-stack, single-box-far, and thick-box variants (record + Mimic for SG2).
+- SH5 hand versions of the same tasks (record + Mimic).
 - SH5 DDS recorder support for VR hand teleoperation.
 - Task-specific table/box assets and teleop motion settings.
 - Minor `robotis_applications` VR publisher update used by this setup.
@@ -71,11 +71,19 @@ For SH5 hand tasks, the dashboard launches:
 - `robotis_vuer vr.launch.py model:=sh5`
 - `cyclo_motion_controller_ros ai_worker_controller.launch.py controller_type:=vr hand:=true`
 
-The headset page is printed by the dashboard. It normally looks like:
+VR lift publishing is disabled for hand tasks. Adjust lift from the Isaac Sim window with **I** (up) and **O** (down); range is about **−0.40 m to 0.0 m** (reset pose starts around −0.25 m).
+
+L-motion on both SG2 and SH5 uses kinematic root teleport (swerve wheels off) so carried boxes stay stable during recording. After gripping a box for ~2 s, L-motion can auto-start when `teleop_auto_l_on_grip_s` is set on the task.
+
+Recording controls (Isaac window focus): **B** start, **L** L-motion, **N** save episode, **R** reset/skip. When the env `success` termination fires (box placed), the recorder also auto-saves if **B** is active.
+
+The dashboard recorder runs inside the Isaac container at `/workspace/cyclo_lab`. Ensure that path mounts your synced `cyclo_lab` checkout (host edits must be visible there).
 
 ```text
 https://<host-ip>:8012
 ```
+
+The headset page is printed by the dashboard. It normally looks like the URL above.
 
 For hand tasks, VR publishing starts disabled by default. Enable it with the SH5 gesture or publish the override:
 
@@ -90,6 +98,105 @@ ros2 topic pub --once /vr/reactivate std_msgs/msg/Bool "{data: true}"
 ## Datasets
 
 Recorded `.hdf5` datasets are intentionally excluded. Re-record demonstrations on the target machine using the dashboard.
+
+SG2 actions stay 19-dimensional (`gripper_l_joint1` only). SH5 actions are 57-dimensional (arms + 20 finger joints per hand + head + lift).
+
+### SG2 Mimic pipeline (after recording)
+
+Each SG2 dashboard task has a matching `Cyclo-Real-Mimic-*` env (see task `mimic_id` in `sg2_ltable_dashboard.py`). Example for L-table:
+
+```bash
+# Inside cyclo_lab container
+RAW=./datasets/ffw_sg2_l_table_raw.hdf5
+IK=./datasets/ffw_sg2_l_table_ik.hdf5
+
+python scripts/sim2real/imitation_learning/mimic/action_data_converter.py \
+  --robot_type FFW_SG2 --input_file "$RAW" --output_file "$IK" --action_type ik
+
+python scripts/sim2real/imitation_learning/mimic/annotate_demos.py \
+  --task Cyclo-Real-Mimic-Pick-Place-LTable-FFW-SG2-v0 --auto \
+  --input_file "$IK" --output_file ./datasets/ffw_sg2_l_table_annotate.hdf5 --enable_cameras --headless
+
+python scripts/sim2real/imitation_learning/mimic/generate_dataset.py \
+  --device cuda --num_envs 10 --task Cyclo-Real-Mimic-Pick-Place-LTable-FFW-SG2-v0 \
+  --generation_num_trials 500 --input_file ./datasets/ffw_sg2_l_table_annotate.hdf5 \
+  --output_file ./datasets/ffw_sg2_l_table_generate.hdf5 --enable_cameras --headless
+
+python scripts/sim2real/imitation_learning/mimic/action_data_converter.py \
+  --robot_type FFW_SG2 --input_file ./datasets/ffw_sg2_l_table_generate.hdf5 \
+  --output_file ./datasets/ffw_sg2_l_table_joint.hdf5 --action_type joint
+```
+
+Basket pick-place uses `Cyclo-Real-Mimic-Pick-Place-FFW-SG2-v0` (upstream env, not in overlay).
+
+### SH5 Mimic pipeline (after recording)
+
+Same steps as SG2, but use `--robot_type FFW_SH5` and the SH5 `mimic_id` from the dashboard (e.g. `Cyclo-Real-Mimic-Pick-Place-LTable-FFW-SH5-v0`). IK actions are 57-dim: both arm EEF poses plus all finger/head/lift joints. During datagen, finger poses are taken from `joint_pos_target` in source demos (not the 1D curl proxy in the Mimic API).
+
+```bash
+RAW=./datasets/ffw_sh5_l_table_raw.hdf5
+IK=./datasets/ffw_sh5_l_table_ik.hdf5
+
+python scripts/sim2real/imitation_learning/mimic/action_data_converter.py \
+  --robot_type FFW_SH5 --input_file "$RAW" --output_file "$IK" --action_type ik
+
+python scripts/sim2real/imitation_learning/mimic/annotate_demos.py \
+  --task Cyclo-Real-Mimic-Pick-Place-LTable-FFW-SH5-v0 --auto \
+  --input_file "$IK" --output_file ./datasets/ffw_sh5_l_table_annotate.hdf5 --enable_cameras --headless
+
+python scripts/sim2real/imitation_learning/mimic/generate_dataset.py \
+  --device cuda --num_envs 10 --task Cyclo-Real-Mimic-Pick-Place-LTable-FFW-SH5-v0 \
+  --generation_num_trials 500 --input_file ./datasets/ffw_sh5_l_table_annotate.hdf5 \
+  --output_file ./datasets/ffw_sh5_l_table_generate.hdf5 --enable_cameras --headless
+
+python scripts/sim2real/imitation_learning/mimic/action_data_converter.py \
+  --robot_type FFW_SH5 --input_file ./datasets/ffw_sh5_l_table_generate.hdf5 \
+  --output_file ./datasets/ffw_sh5_l_table_joint.hdf5 --action_type joint
+
+lerobot-python scripts/sim2real/imitation_learning/data_converter/isaaclab2lerobot.py \
+  --task=Cyclo-Real-Pick-Place-LTable-FFW-SH5-v0 \
+  --robot_type FFW_SH5 \
+  --dataset_file ./datasets/ffw_sh5_l_table_joint.hdf5
+```
+
+SG2 LeRobot export (after joint convert):
+
+```bash
+lerobot-python scripts/sim2real/imitation_learning/data_converter/isaaclab2lerobot.py \
+  --task=Cyclo-Real-Pick-Place-LTable-FFW-SG2-v0 \
+  --robot_type FFW_SG2 \
+  --dataset_file ./datasets/ffw_sg2_l_table_joint.hdf5
+```
+
+### Sim inference (VR + DDS SDK)
+
+Run a task env with the teleop SDK in **inference** mode (`B` enable control, `R` reset, `L` L-motion; SH5 lift via **I**/**O**):
+
+```bash
+python scripts/sim2real/imitation_learning/inference/inference_demos.py \
+  --task Cyclo-Real-Pick-Place-LTable-FFW-SH5-v0 \
+  --robot_type FFW_SH5 --enable_cameras
+```
+
+SG2: `--robot_type FFW_SG2` and the matching `Cyclo-Real-*-FFW-SG2-v0` task id.
+
+## Overlay Sync
+
+`overlays/cyclo_lab/` is the source of truth for AIWORKER changes.
+
+Push overlay onto a live checkout:
+
+```bash
+./sync_overlay.sh ~/path/to/cyclo_lab
+```
+
+Pull edits made directly in `cyclo_lab` back into the overlay:
+
+```bash
+./pull_overlay.sh ~/path/to/cyclo_lab
+```
+
+Fresh installs use `./setup.sh`, which clones upstream pins and rsyncs the overlay automatically. Upstream commit hashes in `manifest.json` are bootstrap pins; teleop fixes ship in the overlay.
 
 ## Notes
 

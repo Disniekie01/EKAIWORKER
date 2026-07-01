@@ -22,3 +22,17 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+_MIMIC_ENTRY = (
+    "cyclo_lab.real_world_tasks.manager_based.FFW_SG2.pick_place.pick_place_mimic_env:"
+    "FFWSG2PickPlaceMimicEnv"
+)
+
+gym.register(
+    id="Cyclo-Real-Mimic-Pick-Place-LTable-FFW-SG2-v0",
+    entry_point=_MIMIC_ENTRY,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.pick_place_l_table_mimic_env_cfg:FFWSG2PickPlaceLTableMimicEnvCfg",
+    },
+    disable_env_checker=True,
+)

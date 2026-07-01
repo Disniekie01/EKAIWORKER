@@ -19,6 +19,7 @@ from __future__ import annotations
 import threading
 import time
 
+import torch
 from cyclonedds.core import Policy, Qos
 from robotis_dds_python.idl.trajectory_msgs.msg import JointTrajectory_
 
@@ -44,6 +45,13 @@ SH5_POLICY_JOINT_NAMES = (
 LEFT_HAND_TOPIC = "/leader/joint_trajectory_command_broadcaster_left_hand/joint_trajectory"
 RIGHT_HAND_TOPIC = "/leader/joint_trajectory_command_broadcaster_right_hand/joint_trajectory"
 
+_DEFAULT_LIFT_KEYBOARD_STEP = 0.03
+_DEFAULT_LIFT_MIN = -0.40
+_DEFAULT_LIFT_MAX = 0.0
+_SH5_FINGER_HOLD_ALPHA = 0.42
+_SH5_FINGER_HOLD_ALPHA_FIRM = 0.68
+_SH5_FINGER_HOLD_ALPHA_CARRY = 0.82
+
 
 class FFWSH5Sdk(FFWSG2Sdk):
     """FFW-SH5 SDK: arms/head/lift from SG2 topics + finger joints on hand topics."""
@@ -53,6 +61,13 @@ class FFWSH5Sdk(FFWSG2Sdk):
     def __init__(self, env, mode: str):
         self.left_hand_trajectory_cmd = None
         self.right_hand_trajectory_cmd = None
+        self._lift_keyboard_cmd: float | None = None
+        self._lift_keyboard_step = _DEFAULT_LIFT_KEYBOARD_STEP
+        self._lift_keyboard_min = _DEFAULT_LIFT_MIN
+        self._lift_keyboard_max = _DEFAULT_LIFT_MAX
+        self._sh5_finger_hold_alpha = _SH5_FINGER_HOLD_ALPHA
+        self._sh5_finger_hold_alpha_firm = _SH5_FINGER_HOLD_ALPHA_FIRM
+        self._sh5_finger_hold_alpha_carry = _SH5_FINGER_HOLD_ALPHA_CARRY
         super().__init__(env, mode)
         # IMPORTANT: the action tensor is consumed by the ActionManager in term
         # registration order, and within each JointPositionAction the values are
@@ -83,9 +98,136 @@ class FFWSH5Sdk(FFWSG2Sdk):
         self.left_hand_thread.start()
         self.right_hand_thread.start()
         print(f"[SH5] Hand DDS topics: {LEFT_HAND_TOPIC}, {RIGHT_HAND_TOPIC}")
-        if getattr(self.env.cfg, "teleop_l_use_swerve", True):
-            self._init_swerve_drive()
+        self._apply_sh5_teleop_config()
         self._keyboard_controls()
+
+    def _apply_sh5_teleop_config(self) -> None:
+        """SH5-only teleop options (lift keyboard jog limits)."""
+        cfg = getattr(self.env, "cfg", None)
+        if cfg is None:
+            return
+        self._lift_keyboard_step = float(
+            getattr(cfg, "teleop_lift_keyboard_step", self._lift_keyboard_step)
+        )
+        self._lift_keyboard_min = float(
+            getattr(cfg, "teleop_lift_min", self._lift_keyboard_min)
+        )
+        self._lift_keyboard_max = float(
+            getattr(cfg, "teleop_lift_max", self._lift_keyboard_max)
+        )
+        self._sh5_finger_hold_alpha = float(
+            getattr(cfg, "teleop_sh5_finger_hold_alpha", self._sh5_finger_hold_alpha)
+        )
+        self._sh5_finger_hold_alpha_firm = float(
+            getattr(cfg, "teleop_sh5_finger_hold_alpha_firm", self._sh5_finger_hold_alpha_firm)
+        )
+        self._sh5_finger_hold_alpha_carry = float(
+            getattr(cfg, "teleop_sh5_finger_hold_alpha_carry", self._sh5_finger_hold_alpha_carry)
+        )
+
+    def after_env_step(self) -> None:
+        """Keep dexterous finger poses stiff while grasping or during L-motion."""
+        super().after_env_step()
+        self._hold_sh5_fingers()
+
+    def _should_hold_sh5_fingers(self) -> bool:
+        return self._check_box_gripped() or self._is_l_motion_active() or self._carry_box
+
+    def _hold_sh5_fingers(self) -> None:
+        if not self._should_hold_sh5_fingers():
+            return
+
+        robot = self.env.scene["robot"]
+        finger_names = [f"finger_l_joint{i}" for i in range(1, 21)] + [
+            f"finger_r_joint{i}" for i in range(1, 21)
+        ]
+        with self.lock:
+            left_cmd = dict(self.left_hand_trajectory_cmd or {})
+            right_cmd = dict(self.right_hand_trajectory_cmd or {})
+
+        if self._is_l_motion_active() or self._carry_box:
+            alpha = self._sh5_finger_hold_alpha_carry
+        else:
+            alpha = self._sh5_finger_hold_alpha_firm
+
+        device = self.env.device
+        env_ids = torch.tensor([0], device=device)
+        joint_pos = robot.data.joint_pos.clone()
+        joint_vel = robot.data.joint_vel.clone()
+        finger_ids: list[int] = []
+
+        for name in finger_names:
+            if name not in robot.joint_names:
+                continue
+            finger_id = robot.joint_names.index(name)
+            finger_ids.append(finger_id)
+            if name in left_cmd:
+                target = float(left_cmd[name])
+            elif name in right_cmd:
+                target = float(right_cmd[name])
+            else:
+                target = float(joint_pos[0, finger_id].item())
+            current = float(joint_pos[0, finger_id].item())
+            blended = current + alpha * (target - current)
+            joint_pos[0, finger_id] = blended
+            joint_vel[0, finger_id] = 0.0
+
+        if not finger_ids:
+            return
+
+        robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+        pos_target = robot.data.joint_pos_target.clone()
+        vel_target = robot.data.joint_vel_target.clone()
+        for finger_id in finger_ids:
+            pos_target[:, finger_id] = joint_pos[0, finger_id]
+            vel_target[:, finger_id] = 0.0
+        robot.set_joint_position_target(pos_target)
+        robot.set_joint_velocity_target(vel_target)
+
+    def _current_lift_position(self) -> float:
+        if self._lift_keyboard_cmd is not None:
+            return self._lift_keyboard_cmd
+        with self.lock:
+            if self.lift_joint_trajectory_cmd and "lift_joint" in self.lift_joint_trajectory_cmd:
+                return float(self.lift_joint_trajectory_cmd["lift_joint"])
+        robot = self.env.scene["robot"]
+        idx = robot.joint_names.index("lift_joint")
+        return float(robot.data.joint_pos[0, idx].item())
+
+    def _jog_lift_keyboard(self, delta: float) -> None:
+        pos = self._current_lift_position() + delta
+        pos = max(self._lift_keyboard_min, min(self._lift_keyboard_max, pos))
+        with self.lock:
+            self._lift_keyboard_cmd = pos
+            self.lift_joint_trajectory_cmd = self.lift_joint_trajectory_cmd or {}
+            self.lift_joint_trajectory_cmd["lift_joint"] = pos
+        print(f"[Control] lift_joint -> {pos:.3f} m")
+
+    def _on_press(self, key):
+        try:
+            if hasattr(key, "char") and key.char in ("i", "I"):
+                self._jog_lift_keyboard(self._lift_keyboard_step)
+                return
+            if hasattr(key, "char") and key.char in ("o", "O"):
+                self._jog_lift_keyboard(-self._lift_keyboard_step)
+                return
+        except AttributeError:
+            pass
+        super()._on_press(key)
+
+    def _request_pose_reset(self):
+        self._lift_keyboard_cmd = None
+        with self.lock:
+            if self.lift_joint_trajectory_cmd is not None:
+                self.lift_joint_trajectory_cmd.pop("lift_joint", None)
+        super()._request_pose_reset()
+
+    def reset(self):
+        self._lift_keyboard_cmd = None
+        with self.lock:
+            if self.lift_joint_trajectory_cmd is not None:
+                self.lift_joint_trajectory_cmd.pop("lift_joint", None)
+        super().reset()
 
     def _resolve_action_joint_order(self) -> list:
         """Build the flat joint-name order the ActionManager actually applies.
@@ -183,3 +325,8 @@ class FFWSH5Sdk(FFWSG2Sdk):
             print("[R] Skip failed episode (not saved) and proceed to the next one")
             print("[B] Start robot control")
             print(f"[L] {l_motion} toward the {self._l_motion_label}")
+        print(
+            f"[I] Lift up (+{self._lift_keyboard_step:.2f} m)    "
+            f"[O] Lift down (-{self._lift_keyboard_step:.2f} m)  "
+            f"range [{self._lift_keyboard_min:.2f}, {self._lift_keyboard_max:.2f}] m"
+        )

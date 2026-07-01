@@ -24,7 +24,11 @@ from isaaclab.sensors import FrameTransformer
 if TYPE_CHECKING:
     from isaaclab.envs import ManagerBasedRLEnv
 
-from .ffw_sg2_l_table_events import get_left_table_drop_zone_world
+from .ffw_sg2_l_table_events import (
+    LEFT_TABLE_DROP_HEIGHT_TOLERANCE,
+    LEFT_TABLE_EDGE_MARGIN,
+    is_object_on_left_table_top,
+)
 
 
 def object_dual_grasped(
@@ -61,10 +65,10 @@ def object_on_left_table(
     env: ManagerBasedRLEnv,
     object_cfg: SceneEntityCfg,
     table_left_cfg: SceneEntityCfg,
-    distance_threshold: float = 0.12,
+    edge_margin: float = LEFT_TABLE_EDGE_MARGIN,
+    height_tolerance: float = LEFT_TABLE_DROP_HEIGHT_TOLERANCE,
 ) -> torch.Tensor:
-    """Check if the object is placed on the left table drop zone."""
-    obj: RigidObject = env.scene[object_cfg.name]
-    drop_zone = get_left_table_drop_zone_world(env, table_left_cfg)
-    distance = torch.linalg.vector_norm(obj.data.root_pos_w - drop_zone, dim=1)
-    return distance < distance_threshold
+    """Check if the object is placed anywhere on the left table tabletop."""
+    return is_object_on_left_table_top(
+        env, object_cfg, table_left_cfg, edge_margin=edge_margin, height_tolerance=height_tolerance
+    )

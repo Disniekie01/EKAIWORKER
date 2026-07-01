@@ -17,6 +17,9 @@ CYCLO = ROOT / "cyclo_lab"
 VR_REPO = ROOT / "robotis_applications"
 AI_REPO = ROOT / "ai_worker"
 PORT = int(os.environ.get("DASHBOARD_PORT", "8765"))
+TELEOP_GRIP_STATUS = Path(
+    os.environ.get("EYKOREA_TELEOP_GRIP_STATUS", "/tmp/eykorea_teleop_grip.json")
+)
 ROS_DOMAIN_ID = os.environ.get("ROS_DOMAIN_ID", "30")
 RMW = os.environ.get("RMW_IMPLEMENTATION", "rmw_fastrtps_cpp")
 # Selectable tasks. Each maps a display label to its gym id, dataset file, and
@@ -54,43 +57,57 @@ LIFT_ENABLED = os.environ.get("SH5_ENABLE_LIFT", "1") not in ("0", "false", "Fal
 VR_IMAGE_ENABLED = os.environ.get("VR_IMAGE", "0") not in ("0", "false", "False")
 
 TASKS: dict[str, dict[str, str]] = {
+    "Basket Pick & Place (SG2)": {
+        "id": "Cyclo-Real-Pick-Place-FFW-SG2-v0",
+        "mimic_id": "Cyclo-Real-Mimic-Pick-Place-FFW-SG2-v0",
+        "dataset": "ffw_sg2_basket_raw.hdf5",
+        "robot": "FFW_SG2",
+    },
     "L-Table Pick & Place (thin box)": {
         "id": "Cyclo-Real-Pick-Place-LTable-FFW-SG2-v0",
+        "mimic_id": "Cyclo-Real-Mimic-Pick-Place-LTable-FFW-SG2-v0",
         "dataset": "ffw_sg2_l_table_raw.hdf5",
         "robot": "FFW_SG2",
     },
     "Box Stack (thick box)": {
         "id": "Cyclo-Real-Box-Stack-FFW-SG2-v0",
+        "mimic_id": "Cyclo-Real-Mimic-Box-Stack-FFW-SG2-v0",
         "dataset": "ffw_sg2_box_stack_raw.hdf5",
         "robot": "FFW_SG2",
     },
     "Single Box Far (rear table)": {
         "id": "Cyclo-Real-Single-Box-Far-FFW-SG2-v0",
+        "mimic_id": "Cyclo-Real-Mimic-Single-Box-Far-FFW-SG2-v0",
         "dataset": "ffw_sg2_single_box_far_raw.hdf5",
         "robot": "FFW_SG2",
     },
     "Single Box Far (thick box)": {
         "id": "Cyclo-Real-Single-Box-Far-Thick-FFW-SG2-v0",
+        "mimic_id": "Cyclo-Real-Mimic-Single-Box-Far-Thick-FFW-SG2-v0",
         "dataset": "ffw_sg2_single_box_far_thick_raw.hdf5",
         "robot": "FFW_SG2",
     },
     "L-Table Pick & Place (thin, hands)": {
         "id": "Cyclo-Real-Pick-Place-LTable-FFW-SH5-v0",
+        "mimic_id": "Cyclo-Real-Mimic-Pick-Place-LTable-FFW-SH5-v0",
         "dataset": "ffw_sh5_l_table_raw.hdf5",
         "robot": "FFW_SH5",
     },
     "Box Stack (thick, hands)": {
         "id": "Cyclo-Real-Box-Stack-FFW-SH5-v0",
+        "mimic_id": "Cyclo-Real-Mimic-Box-Stack-FFW-SH5-v0",
         "dataset": "ffw_sh5_box_stack_raw.hdf5",
         "robot": "FFW_SH5",
     },
     "Single Box Far (rear, hands)": {
         "id": "Cyclo-Real-Single-Box-Far-FFW-SH5-v0",
+        "mimic_id": "Cyclo-Real-Mimic-Single-Box-Far-FFW-SH5-v0",
         "dataset": "ffw_sh5_single_box_far_raw.hdf5",
         "robot": "FFW_SH5",
     },
     "Single Box Far (thick, hands)": {
         "id": "Cyclo-Real-Single-Box-Far-Thick-FFW-SH5-v0",
+        "mimic_id": "Cyclo-Real-Mimic-Single-Box-Far-Thick-FFW-SH5-v0",
         "dataset": "ffw_sh5_single_box_far_thick_raw.hdf5",
         "robot": "FFW_SH5",
     },
@@ -102,7 +119,7 @@ _selected_task = next(
     next(iter(TASKS)),
 )
 ROBOT_TYPE = os.environ.get("ROBOT_TYPE", "FFW_SG2")
-NUM_DEMOS = os.environ.get("NUM_DEMOS", "4")
+NUM_DEMOS = os.environ.get("NUM_DEMOS", "0")
 CYCLO_C = "cyclo_lab"
 VR_C = "robotis-applications"
 AI_C = "ai_worker"
@@ -444,6 +461,13 @@ def _reconcile(key: str, container_up: bool, container: str, pattern: str) -> No
     _set_status(key, "stopped")
 
 
+def _read_teleop_grip() -> dict:
+    try:
+        return json.loads(TELEOP_GRIP_STATUS.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {"state": "unknown", "held_s": 0.0, "auto_l_in_s": None, "auto_l_enabled": False}
+
+
 def snapshot() -> dict:
     # Bracket the first char of each pattern so `pgrep -f` does not match the
     # shell that is running pgrep (its own command line contains the pattern).
@@ -474,6 +498,7 @@ def snapshot() -> dict:
         "teleop_matches_task": teleop_ok,
         "running_vr_model": vr_running,
         "running_ai_hand": hand_running,
+        "grip": _read_teleop_grip(),
         "tasks": list(TASKS.keys()),
         "tasks_by_robot": {
             robot: [label for label, t in TASKS.items() if t["robot"] == robot]
@@ -526,8 +551,8 @@ a{color:#60a5fa}
 <div class="card"><h3>Logs</h3><pre id="logs"></pre></div>
 <p><b>Launch Record</b> restarts VR + motion controller for the selected robot, then starts Isaac.
 Gripper tasks use <code>model:=sg2 hand:=false</code>; hand tasks use <code>model:=sh5 hand:=true</code>.
-VR: accept cert at Vuer URL. SG2: squeeze both grips. SH5: hand gesture to toggle publishing.
-B=record, L=face target table, N=save, R=reset.</p>
+VR: accept cert at Vuer URL. SG2: squeeze both grips. SH5: hand gesture to toggle publishing; <code>I</code>/<code>O</code> lift up/down in Isaac. Recording: <code>B</code> start, <code>N</code> save (or auto-save on task success), <code>R</code> reset, <code>L</code> L-motion.
+B=record, L=face target table (or auto after 2s gripped), N=save, R=reset.</p>
 </main>
 <script>
 async function act(a){await fetch('/api/'+a,{method:'POST'});refresh()}
@@ -564,6 +589,13 @@ async function refresh(){
  h+='Expected teleop: <span class="tag">vr model='+d.vr_model+', hand='+d.hand+'</span><br>';
  h+='Running teleop: <span class="tag">vr='+(d.running_vr_model||'none')+', hand='+(d.running_ai_hand||'none')+'</span> ';
  h+='<span class="'+teleopCls+'">('+teleopTxt+')</span><br>';
+ const g=d.grip||{};
+ const gripCls=g.state==='gripped'?'ok':'';
+ let gripTxt=g.state||'unknown';
+ if(g.state==='gripped'&&g.auto_l_enabled&&g.auto_l_in_s!=null){
+  gripTxt+=' (auto-L in '+g.auto_l_in_s+'s)';
+ }
+ h+='Grip: <span class="tag '+gripCls+'">'+gripTxt+'</span><br>';
  h+='Vuer: <a href="'+d.vuer_url+'" target="_blank">'+d.vuer_url+'</a> ('+d.vuer_ws+')</p>';
  document.getElementById('meta').innerHTML=h;
  let s='';

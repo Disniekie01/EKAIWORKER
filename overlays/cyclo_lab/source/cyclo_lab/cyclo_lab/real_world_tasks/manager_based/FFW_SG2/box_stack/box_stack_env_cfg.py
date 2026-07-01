@@ -180,6 +180,8 @@ class BoxStackEnvCfg(ManagerBasedRLEnvCfg):
     events = None
     curriculum = None
 
+    teleop_l_use_swerve: bool = False
+    teleop_auto_l_on_grip_s: float = 2.0
     def __post_init__(self):
         self.decimation = 5
         self.episode_length_s = 45.0

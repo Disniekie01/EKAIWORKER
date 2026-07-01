@@ -192,7 +192,8 @@ class SingleBoxFarThickEnvCfg(ManagerBasedRLEnvCfg):
     teleop_l_forward_duration_s: float = 8.0
     teleop_l_rotation_duration_s: float = 3.0
     teleop_l_target_label: str = "rear table"
-
+    teleop_l_use_swerve: bool = False
+    teleop_auto_l_on_grip_s: float = 2.0
     def __post_init__(self):
         self.decimation = 5
         self.episode_length_s = 60.0

@@ -14,6 +14,7 @@
 #
 # Author: Taehyeong Kim
 
+import json
 import os
 import math
 import threading
@@ -36,6 +37,19 @@ from robotis_dds_python.idl.builtin_interfaces.msg import Time_
 from robotis_dds_python.tools.topic_manager import TopicManager
 
 
+SG2_POLICY_JOINT_NAMES = (
+    [f"arm_l_joint{i}" for i in range(1, 8)]
+    + ["gripper_l_joint1"]
+    + [f"arm_r_joint{i}" for i in range(1, 8)]
+    + ["gripper_r_joint1", "lift_joint", "head_joint1", "head_joint2"]
+)
+
+_LEFT_GRIP_SMOOTH_ALPHA = 0.20
+_LEFT_FINGER_HOLD_MIN = 0.12
+_LEFT_FINGER_HOLD_ALPHA = 0.38
+_LEFT_FINGER_HOLD_ALPHA_FIRM = 0.62
+
+
 class FFWSG2Sdk:
     """FFWSG2Sdk class for DDS teleoperation and publishing humanoid robot state/images."""
 
@@ -49,6 +63,9 @@ class FFWSG2Sdk:
         self.domain_id = int(os.getenv("ROS_DOMAIN_ID", 0))
         self.left_arm_trajectory_cmd = None
         self.right_arm_trajectory_cmd = None
+        self._left_gripper_cmd: float | None = None
+        self._right_gripper_cmd: float | None = None
+        self._left_gripper_smooth: float | None = None
         self.head_joint_trajectory_cmd = None
         self.lift_joint_trajectory_cmd = None
         self._started = False
@@ -64,12 +81,14 @@ class FFWSG2Sdk:
         self._rotation_target_yaw = 0.0
         self._rotation_start_time = 0.0
         self._rotation_duration_s = 3.0
+        self._rotation_sim_alpha = 0.0
         self._forward_active = False
         self._forward_start_pos = None
         self._forward_end_pos = None
         self._forward_yaw = 0.0
         self._forward_start_time = 0.0
         self._forward_duration_s = 2.0
+        self._forward_sim_alpha = 0.0
         self._forward_distance_m = 0.30
         self._pending_reset_pose = False
         self._home_root_pose = None  # (1, 7) tensor captured on first publish
@@ -77,8 +96,8 @@ class FFWSG2Sdk:
         # carried rigidly with it via this relative transform so it does not
         # slip out of the grippers.
         self._carry_box = False
-        self._box_rel_pos = None  # (1, 3) box pos in root frame
-        self._box_rel_quat = None  # (1, 4) box quat in root frame
+        self._box_rel_pos = None  # (1, 3) box pos in robot root frame
+        self._box_rel_quat = None  # (1, 4) box quat in robot root frame
         self._box_asset_name = "cardboard_box"
         # Swerve-drive L-motion (SH5): uses cmd_vel-style base motion instead of root teleport.
         self._use_swerve_l_motion = False
@@ -86,23 +105,22 @@ class FFWSG2Sdk:
         self._swerve_phase = None
         self._swerve_steering_joint_ids: list[int] = []
         self._swerve_wheel_joint_ids: list[int] = []
-        self._swerve_forward_start_xy = None
-        self._swerve_forward_dir_xy = None
-        self._last_swerve_update_time = time.monotonic()
         self._swerve_yaw_tol = 0.08
         self._swerve_max_angular_z = 0.6
         self._swerve_max_linear_x = 0.25
+        # Grip detection + optional auto L-motion after sustained grasp.
+        self._auto_l_on_grip_s = 0.0
+        self._grip_start_time: float | None = None
+        self._grip_status = "open"
+        self._last_grip_status = "open"
+        self._auto_l_fired_this_episode = False
+        self._teleop_grip_status_path = os.environ.get(
+            "EYKOREA_TELEOP_GRIP_STATUS", "/tmp/eykorea_teleop_grip.json"
+        )
         self.lock = threading.Lock()  # Protect shared state
 
         # Initialize current joint state - will be updated only when commands are received
         self.current_joint_state = {}
-
-        # Define joint names for FFW_SG2 humanoid robot
-        self.joint_names = [
-            "arm_l_joint1", "arm_l_joint2", "arm_l_joint3", "arm_l_joint4", "arm_l_joint5", "arm_l_joint6", "arm_l_joint7", "gripper_l_joint1",
-            "arm_r_joint1", "arm_r_joint2", "arm_r_joint3", "arm_r_joint4", "arm_r_joint5", "arm_r_joint6", "arm_r_joint7", "gripper_r_joint1",
-            "lift_joint", "head_joint1", "head_joint2"
-        ]
 
         # DDS Topic Manager
         topic_manager = TopicManager(domain_id=self.domain_id)
@@ -170,6 +188,9 @@ class FFWSG2Sdk:
         self.listener.start()
 
         self._apply_env_teleop_config()
+        self.joint_names = self._resolve_action_joint_order()
+        if self._use_swerve_l_motion:
+            self._init_swerve_drive()
         self._keyboard_controls()
 
     def _apply_env_teleop_config(self) -> None:
@@ -187,21 +208,66 @@ class FFWSG2Sdk:
         )
         self._l_motion_label = str(getattr(cfg, "teleop_l_target_label", self._l_motion_label))
         self._use_swerve_l_motion = bool(getattr(cfg, "teleop_l_use_swerve", self._use_swerve_l_motion))
+        self._auto_l_on_grip_s = float(
+            getattr(cfg, "teleop_auto_l_on_grip_s", self._auto_l_on_grip_s)
+        )
+
+    def _resolve_action_joint_order(self) -> list[str]:
+        """Match the flat action vector layout the env ActionManager applies."""
+        try:
+            am = self.env.action_manager
+            order: list[str] = []
+            for term_name in am.active_terms:
+                term = am.get_term(term_name)
+                joint_names = getattr(term, "_joint_names", None)
+                if not joint_names:
+                    raise RuntimeError(f"action term '{term_name}' exposes no joint names")
+                order.extend(joint_names)
+            if not order:
+                raise RuntimeError("action manager produced empty joint order")
+            print(f"[SG2] Action joint order resolved ({len(order)} joints).")
+            return order
+        except Exception as exc:
+            print(f"[SG2] WARNING: using static action joint order ({exc}).")
+            return list(SG2_POLICY_JOINT_NAMES)
+
+    def _smooth_left_gripper(self, target: float | None) -> float | None:
+        """Ease left gripper motion so the fingers do not snap shut."""
+        if target is None:
+            self._left_gripper_smooth = None
+            return None
+        if self._left_gripper_smooth is None:
+            self._left_gripper_smooth = target
+        else:
+            self._left_gripper_smooth += _LEFT_GRIP_SMOOTH_ALPHA * (
+                target - self._left_gripper_smooth
+            )
+        return self._left_gripper_smooth
 
     # ----------------------
     # Keyboard controls
     # ----------------------
     def _keyboard_controls(self):
-        print("\n[Control] Press keys to control the FFW_SG2 robot:")
+        print("\n[Control] Press keys to control the FFW-SG2 robot:")
+        l_motion = (
+            "swerve-drive rotate + forward"
+            if self._use_swerve_l_motion and self._swerve_controller is not None
+            else f"smooth rotate + forward toward the {self._l_motion_label}"
+        )
         if self.mode == 'record':
             print("[N / Right Joystick Button] Save successful episode and proceed to the next one")
             print("[R / Left Joystick Button] Skip failed episode (not saved) and proceed to the next one")
             print("[B / Right Joystick Button] Start recording the current episode")
-            print(f"[L] Smoothly rotate robot to face the {self._l_motion_label}, then move forward")
+            print(f"[L] {l_motion}")
+            if self._auto_l_on_grip_s > 0:
+                print(
+                    f"[Grip] Hold the box gripped for {self._auto_l_on_grip_s:.1f}s "
+                    "to auto-start L-motion (once per episode)"
+                )
         elif self.mode == 'inference':
             print("[R] Skip failed episode (not saved) and proceed to the next one")
             print("[B] Start robot control")
-            print(f"[L] Smoothly rotate robot to face the {self._l_motion_label}, then move forward")
+            print(f"[L] {l_motion}")
 
     def _on_press(self, key):
         try:
@@ -217,6 +283,7 @@ class FFWSG2Sdk:
                     if self._first_episode:
                         self._first_episode = False
                     self._episode_phase = "recording"  # Now recording
+                    self._auto_l_fired_this_episode = False
                 elif key.char == 'r':
                     self._started = False
                     self._reset_state = True
@@ -226,12 +293,14 @@ class FFWSG2Sdk:
                     if self._episode_phase == "recording" and not self._first_episode:
                         self._first_episode = True
                         self._episode_phase = "idle"
+                    self._reset_grip_tracking()
                 elif key.char == 'n':
                     self._started = False
                     self._reset_state = True
                     self._call_callback("N")
                     # After saving, go back to idle state
                     self._episode_phase = "idle"
+                    self._reset_grip_tracking()
             elif self.mode == 'inference':
                 if key.char == 'b':
                     self._started = True
@@ -260,9 +329,30 @@ class FFWSG2Sdk:
         self._forward_active = False
         self._carry_box = False
 
+    def _advance_l_motion(self) -> None:
+        """Step rotate/forward L-motion once (kinematic root + box carry)."""
+        if self._use_swerve_l_motion and self._swerve_controller is not None:
+            self._step_swerve_l_motion()
+        else:
+            self._step_yaw_rotation()
+            self._step_forward_motion()
+
     # ----------------------
     # Subscriber loops for both arms
     # ----------------------
+    def _ingest_arm_trajectory_cmd(
+        self, joint_dict: dict[str, float], side: str
+    ) -> dict[str, float]:
+        """Split gripper commands from arm IK so they are never overwritten."""
+        gripper_key = f"gripper_{side}_joint1"
+        if gripper_key in joint_dict:
+            gripper_val = float(joint_dict[gripper_key])
+            if side == "l":
+                self._left_gripper_cmd = gripper_val
+            else:
+                self._right_gripper_cmd = gripper_val
+        return {k: v for k, v in joint_dict.items() if k != gripper_key}
+
     def _left_arm_subscriber_loop(self):
         """Continuously read joint trajectory commands from the leader."""
         try:
@@ -274,8 +364,9 @@ class FFWSG2Sdk:
                             # Merge instead of replace: arm IK and gripper commands
                             # share this topic but arrive as separate partial
                             # messages, so replacing would erase the gripper.
+                            arm_only = self._ingest_arm_trajectory_cmd(joint_dict, "l")
                             self.left_arm_trajectory_cmd = self.left_arm_trajectory_cmd or {}
-                            self.left_arm_trajectory_cmd.update(joint_dict)
+                            self.left_arm_trajectory_cmd.update(arm_only)
                 time.sleep(0.001)  # 1ms sleep to reduce CPU load
         except Exception as e:
             print("Left arm subscriber thread exception:", e)
@@ -297,8 +388,9 @@ class FFWSG2Sdk:
                             # Merge instead of replace: arm IK and gripper commands
                             # share this topic but arrive as separate partial
                             # messages, so replacing would erase the gripper.
+                            arm_only = self._ingest_arm_trajectory_cmd(joint_dict, "r")
                             self.right_arm_trajectory_cmd = self.right_arm_trajectory_cmd or {}
-                            self.right_arm_trajectory_cmd.update(joint_dict)
+                            self.right_arm_trajectory_cmd.update(arm_only)
                 time.sleep(0.001)  # 1ms sleep to reduce CPU load
         except Exception as e:
             print("Right arm subscriber thread exception:", e)
@@ -369,17 +461,20 @@ class FFWSG2Sdk:
                                 self._reset_state = False
                                 self._first_episode = False
                                 self._episode_phase = "recording"  # Now recording
+                                self._auto_l_fired_this_episode = False
                             elif self._episode_phase == "recording":
                                 # Currently recording: save episode and go back to idle
                                 self._started = False
                                 self._reset_state = True
                                 self._call_callback("N")
                                 self._episode_phase = "idle"  # Now idle, waiting for next start
+                                self._reset_grip_tracking()
                             elif self._episode_phase == "idle":
                                 # Currently idle: start new episode
                                 self._started = True
                                 self._reset_state = False
                                 self._episode_phase = "recording"  # Now recording
+                                self._auto_l_fired_this_episode = False
                     elif joystick_trigger == 'left':
                         with self.lock:
                             # Reset current episode (don't save)
@@ -387,6 +482,7 @@ class FFWSG2Sdk:
                             self._reset_state = True
                             self._request_pose_reset()
                             self._call_callback("R")
+                            self._reset_grip_tracking()
                             # If resetting while recording before first episode was saved, go back to first episode state
                             if self._episode_phase == "recording" and not self._first_episode:
                                 # We started recording but haven't saved yet - reset to first episode
@@ -480,7 +576,11 @@ class FFWSG2Sdk:
         return state
 
     def _get_device_state(self):
-        """Return latest joint positions, starting with current robot state and updating with received commands."""
+        """Return latest joint positions for the action vector."""
+        return self._build_live_joint_state()
+
+    def _build_live_joint_state(self) -> dict[str, float]:
+        """Merge sim state with the latest DDS teleop commands."""
         with self.lock:
             # Start with current robot joint positions
             obs_joint_name = self.env.scene["robot"].data.joint_names
@@ -507,6 +607,13 @@ class FFWSG2Sdk:
             if self.right_arm_trajectory_cmd:
                 joint_state.update(self.right_arm_trajectory_cmd)
 
+            if self._left_gripper_cmd is not None:
+                grip = self._smooth_left_gripper(self._left_gripper_cmd)
+                if grip is not None and "gripper_l_joint1" in self.joint_names:
+                    joint_state["gripper_l_joint1"] = grip
+            if self._right_gripper_cmd is not None:
+                joint_state["gripper_r_joint1"] = self._right_gripper_cmd
+
             if self.head_joint_trajectory_cmd:
                 joint_state.update(self.head_joint_trajectory_cmd)
 
@@ -525,10 +632,62 @@ class FFWSG2Sdk:
 
         joint_state = action['joint_state']
         positions = [joint_state.get(name, 0.0) for name in self.joint_names]
-        return torch.tensor(positions, device=self.env.device, dtype=torch.float32).unsqueeze(0)
+        return torch.tensor(
+            positions, device=self.env.device, dtype=torch.float32
+        ).unsqueeze(0)
+
+    def after_env_step(self) -> None:
+        """Post-physics hooks: finger stiffening and box carry sync."""
+        if self._carry_box:
+            self._apply_box_carry()
+        self._blend_left_gripper_fingers()
+
+    def _left_gripper_hold_value(self) -> float | None:
+        with self.lock:
+            raw = self._left_gripper_cmd
+        if raw is None:
+            return self._left_gripper_smooth
+        return self._smooth_left_gripper(raw)
+
+    def _blend_left_gripper_fingers(self) -> None:
+        """Blend mimic finger joints toward the smoothed close angle (not joint1)."""
+        grip = self._left_gripper_hold_value()
+        if grip is None or grip < _LEFT_FINGER_HOLD_MIN:
+            return
+
+        robot = self.env.scene["robot"]
+        try:
+            finger_ids = [robot.joint_names.index(f"gripper_l_joint{i}") for i in range(2, 5)]
+        except ValueError:
+            return
+
+        hold_alpha = (
+            _LEFT_FINGER_HOLD_ALPHA_FIRM if grip >= 0.45 else _LEFT_FINGER_HOLD_ALPHA
+        )
+        device = self.env.device
+        env_ids = torch.tensor([0], device=device)
+        grip_t = float(grip)
+
+        joint_pos = robot.data.joint_pos.clone()
+        joint_vel = robot.data.joint_vel.clone()
+        for finger_id in finger_ids:
+            current = float(joint_pos[0, finger_id].item())
+            blended = current + hold_alpha * (grip_t - current)
+            joint_pos[0, finger_id] = blended
+            joint_vel[0, finger_id] = 0.0
+        robot.write_joint_state_to_sim(joint_pos, joint_vel, env_ids=env_ids)
+
+        pos_target = robot.data.joint_pos_target.clone()
+        vel_target = robot.data.joint_vel_target.clone()
+        for finger_id in finger_ids:
+            pos_target[:, finger_id] = joint_pos[0, finger_id]
+            vel_target[:, finger_id] = 0.0
+        robot.set_joint_position_target(pos_target)
+        robot.set_joint_velocity_target(vel_target)
 
     def publish_observations(self):
         """Publish joint states and camera images."""
+        self._step_grip_auto_l()
         # Capture the robot's home root pose once, before any L motion edits it.
         if self._home_root_pose is None:
             robot = self.env.scene["robot"]
@@ -544,11 +703,8 @@ class FFWSG2Sdk:
             self._restore_home_pose()
         elif pending_face_left:
             self.face_left_table()
-        if self._use_swerve_l_motion and self._swerve_controller is not None:
-            self._step_swerve_l_motion()
-        else:
-            self._step_yaw_rotation()
-            self._step_forward_motion()
+        if self._is_l_motion_active():
+            self._advance_l_motion()
         self._publish_joint_states()
         self._publish_camera("cam_head")
         # self._publish_camera("cam_wrist_right")
@@ -580,8 +736,127 @@ class FFWSG2Sdk:
         self._rotation_active = False
         self._forward_active = False
         self._pending_reset_pose = False
+        self._pending_face_left = False
         self._carry_box = False
         self._swerve_phase = None
+        self._reset_grip_tracking()
+
+    def on_episode_saved(self) -> None:
+        """Match VR/joystick state after auto-save (same as manual N / right trigger)."""
+        with self.lock:
+            self._started = False
+            self._reset_state = True
+            self._episode_phase = "idle"
+        self._rotation_active = False
+        self._forward_active = False
+        self._pending_reset_pose = False
+        self._pending_face_left = False
+        self._carry_box = False
+        self._swerve_phase = None
+        self._reset_grip_tracking()
+
+    def _reset_grip_tracking(self) -> None:
+        self._grip_start_time = None
+        self._auto_l_fired_this_episode = False
+        self._grip_status = "open"
+        self._last_grip_status = "open"
+        self._left_gripper_smooth = None
+        self._write_grip_status("open", 0.0)
+
+    def is_l_motion_active(self) -> bool:
+        """True while rotate/forward L-motion is running."""
+        return self._is_l_motion_active()
+
+    def use_kinematic_l_record_step(self) -> bool:
+        """During demo recording, L-motion should skip physics integration."""
+        return self._started and self._is_l_motion_active()
+
+    def sync_kinematic_state(self) -> None:
+        """After kinematic L-motion, keep the carried box aligned with the base."""
+        if self._carry_box:
+            self._apply_box_carry()
+
+    def _is_l_motion_active(self) -> bool:
+        if self._swerve_phase is not None:
+            return True
+        return self._rotation_active or self._forward_active
+
+    def _motion_alpha(self, *, start_time: float, duration_s: float, sim_alpha: float) -> float:
+        """Smoothstep progress: fixed sim dt per recorded frame, wall clock when idle."""
+        if self._started:
+            return self._smoothstep(min(sim_alpha, 1.0))
+        elapsed = time.monotonic() - start_time
+        return self._smoothstep(min(elapsed / duration_s, 1.0))
+
+    def _check_box_gripped(self) -> bool:
+        """True when both end effectors grasp the task box (same obs as env cfg)."""
+        try:
+            terms = self.env.observation_manager.compute_group("subtask_terms")
+            if "dual_grasp_box" in terms:
+                return bool(terms["dual_grasp_box"][0].item())
+        except Exception:
+            pass
+        return False
+
+    def _write_grip_status(self, state: str, held_s: float) -> None:
+        auto_l_in = None
+        if state == "gripped" and self._auto_l_on_grip_s > 0:
+            auto_l_in = max(0.0, self._auto_l_on_grip_s - held_s)
+        payload = {
+            "state": state,
+            "held_s": round(held_s, 1),
+            "auto_l_in_s": round(auto_l_in, 1) if auto_l_in is not None else None,
+            "auto_l_enabled": self._auto_l_on_grip_s > 0,
+        }
+        try:
+            with open(self._teleop_grip_status_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+        except OSError:
+            pass
+
+    def _step_grip_auto_l(self) -> None:
+        gripped = self._check_box_gripped()
+        now = time.monotonic()
+
+        if gripped:
+            if self._grip_start_time is None:
+                self._grip_start_time = now
+                if self._last_grip_status != "gripped":
+                    if self._auto_l_on_grip_s > 0:
+                        print(
+                            f"[Teleop] Box gripped — hold {self._auto_l_on_grip_s:.1f}s "
+                            "to auto-start L-motion"
+                        )
+                    else:
+                        print("[Teleop] Box gripped")
+            held_s = now - self._grip_start_time
+            self._grip_status = "gripped"
+            self._write_grip_status("gripped", held_s)
+
+            if (
+                self._auto_l_on_grip_s > 0
+                and self.mode == "record"
+                and self._episode_phase == "recording"
+                and self._started
+                and not self._auto_l_fired_this_episode
+                and not self._is_l_motion_active()
+                and held_s >= self._auto_l_on_grip_s
+            ):
+                with self.lock:
+                    self._pending_face_left = True
+                self._auto_l_fired_this_episode = True
+                print(
+                    f"[Teleop] Box held {self._auto_l_on_grip_s:.1f}s — "
+                    "auto-starting L-motion"
+                )
+        else:
+            if self._last_grip_status == "gripped":
+                print("[Teleop] Grip released")
+            self._grip_start_time = None
+            self._grip_status = "open"
+            self._write_grip_status("open", 0.0)
+
+        self._last_grip_status = self._grip_status
 
     def _restore_home_pose(self):
         """Restore the robot root pose (position + orientation) to its home/start
@@ -601,26 +876,24 @@ class FFWSG2Sdk:
 
     def face_left_table(self):
         """Begin a smooth rotation toward the task target, then move forward."""
+        self._auto_l_fired_this_episode = True
+        self._capture_box_carry()
         if self._use_swerve_l_motion and self._swerve_controller is not None:
             self._forward_active = False
             self._rotation_active = False
             self._swerve_phase = "rotate"
-            self._rotation_target_yaw = self._face_left_yaw
-            self._swerve_forward_start_xy = None
-            self._swerve_forward_dir_xy = None
+            self._begin_yaw_rotation(self._face_left_yaw)
             print(
                 f"[Control] Swerve: rotating to face the {self._l_motion_label}, "
                 f"then driving forward {self._forward_distance_m:.2f} m"
             )
             return
         self._forward_active = False
-        self._capture_box_carry()
         self._begin_yaw_rotation(self._face_left_yaw)
         print(f"[Control] Rotating robot to face the {self._l_motion_label}")
 
     def _capture_box_carry(self):
-        """Record the box pose relative to the robot root so it can be carried
-        rigidly with the robot during the L motion (prevents it slipping out)."""
+        """Record box pose in robot root frame for rigid carry during L-motion."""
         try:
             robot = self.env.scene["robot"]
             box = self.env.scene[self._box_asset_name]
@@ -638,8 +911,8 @@ class FFWSG2Sdk:
         self._box_rel_quat = math_utils.quat_mul(inv_root_quat, box_quat)
         self._carry_box = True
 
-    def _carry_box_with_root(self):
-        """Re-impose the captured box->root relative transform on the box."""
+    def _apply_box_carry(self):
+        """Re-impose the captured box->root relative transform."""
         if not self._carry_box or self._box_rel_pos is None:
             return
         try:
@@ -652,8 +925,10 @@ class FFWSG2Sdk:
         env_ids = torch.tensor([0], device=device)
         root_pos = robot.data.root_pos_w[0:1]
         root_quat = robot.data.root_quat_w[0:1]
-        box_pos = root_pos + math_utils.quat_apply(root_quat, self._box_rel_pos.to(device))
-        box_quat = math_utils.quat_mul(root_quat, self._box_rel_quat.to(device))
+        rel_pos = self._box_rel_pos.to(device)
+        rel_quat = self._box_rel_quat.to(device)
+        box_pos = root_pos + math_utils.quat_apply(root_quat, rel_pos)
+        box_quat = math_utils.quat_mul(root_quat, rel_quat)
         box_pose = torch.cat([box_pos, box_quat], dim=-1)
         box.write_root_pose_to_sim(box_pose, env_ids=env_ids)
         box.write_root_velocity_to_sim(torch.zeros(1, 6, device=device), env_ids=env_ids)
@@ -667,6 +942,7 @@ class FFWSG2Sdk:
         self._rotation_start_yaw = self._get_robot_yaw()
         self._rotation_target_yaw = target_yaw
         self._rotation_start_time = time.monotonic()
+        self._rotation_sim_alpha = 0.0
         self._rotation_active = True
 
     def _begin_forward_motion(self):
@@ -681,6 +957,7 @@ class FFWSG2Sdk:
         self._forward_end_pos = self._forward_start_pos + math_utils.quat_apply(quat, offset)
         self._forward_yaw = self._get_robot_yaw()
         self._forward_start_time = time.monotonic()
+        self._forward_sim_alpha = 0.0
         self._forward_active = True
 
     def _smoothstep(self, alpha: float) -> float:
@@ -711,11 +988,25 @@ class FFWSG2Sdk:
         if not self._rotation_active:
             return
 
-        elapsed = time.monotonic() - self._rotation_start_time
-        alpha = self._smoothstep(min(elapsed / self._rotation_duration_s, 1.0))
+        if self._started:
+            self._rotation_sim_alpha = min(
+                1.0,
+                self._rotation_sim_alpha + self._sim_step_dt() / self._rotation_duration_s,
+            )
+            alpha = self._motion_alpha(
+                start_time=self._rotation_start_time,
+                duration_s=self._rotation_duration_s,
+                sim_alpha=self._rotation_sim_alpha,
+            )
+        else:
+            alpha = self._motion_alpha(
+                start_time=self._rotation_start_time,
+                duration_s=self._rotation_duration_s,
+                sim_alpha=0.0,
+            )
         yaw = self._lerp_yaw(self._rotation_start_yaw, self._rotation_target_yaw, alpha)
         self._set_robot_yaw(yaw)
-        self._carry_box_with_root()
+        self._apply_box_carry()
 
         if alpha >= 1.0:
             self._rotation_active = False
@@ -726,28 +1017,42 @@ class FFWSG2Sdk:
         if not self._forward_active:
             return
 
-        elapsed = time.monotonic() - self._forward_start_time
-        alpha = self._smoothstep(min(elapsed / self._forward_duration_s, 1.0))
+        if self._started:
+            self._forward_sim_alpha = min(
+                1.0,
+                self._forward_sim_alpha + self._sim_step_dt() / self._forward_duration_s,
+            )
+            alpha = self._motion_alpha(
+                start_time=self._forward_start_time,
+                duration_s=self._forward_duration_s,
+                sim_alpha=self._forward_sim_alpha,
+            )
+        else:
+            alpha = self._motion_alpha(
+                start_time=self._forward_start_time,
+                duration_s=self._forward_duration_s,
+                sim_alpha=0.0,
+            )
         pos = self._forward_start_pos + alpha * (self._forward_end_pos - self._forward_start_pos)
         self._set_robot_pose(pos, self._forward_yaw)
-        self._carry_box_with_root()
+        self._apply_box_carry()
 
         if alpha >= 1.0:
             self._forward_active = False
             self._carry_box = False
             print(f"[Control] Robot finished moving forward toward the {self._l_motion_label}")
 
-    def _init_swerve_drive(self) -> None:
-        """Set up the SH5 swerve controller (same stack as sh5_dds_bringup)."""
-        import sys
-        from pathlib import Path
-
-        bringup_dir = Path(__file__).resolve().parents[2] / "bringup"
-        if str(bringup_dir) not in sys.path:
-            sys.path.insert(0, str(bringup_dir))
-
-        from common import robotis_config as bringup_cfg
-        from common.swerve_drive import SwerveDriveController, SwerveModule
+    def _resolve_swerve_profile(self, joint_names: list[str]):
+        """Return swerve constants for the loaded robot articulation."""
+        names = set(joint_names)
+        from cyclo_lab.assets.robots.FFW_SG2 import (
+            SG2_SWERVE_MODULE_ANGLE_OFFSETS,
+            SG2_SWERVE_MODULE_X_OFFSETS,
+            SG2_SWERVE_MODULE_Y_OFFSETS,
+            SG2_SWERVE_STEERING_JOINTS,
+            SG2_SWERVE_WHEEL_JOINTS,
+            SG2_SWERVE_WHEEL_RADIUS,
+        )
         from cyclo_lab.assets.robots.FFW_SH5 import (
             SH5_SWERVE_MODULE_ANGLE_OFFSETS,
             SH5_SWERVE_MODULE_X_OFFSETS,
@@ -757,25 +1062,70 @@ class FFWSG2Sdk:
             SH5_SWERVE_WHEEL_RADIUS,
         )
 
+        profiles = (
+            (
+                "SH5",
+                SH5_SWERVE_STEERING_JOINTS,
+                SH5_SWERVE_WHEEL_JOINTS,
+                SH5_SWERVE_MODULE_X_OFFSETS,
+                SH5_SWERVE_MODULE_Y_OFFSETS,
+                SH5_SWERVE_MODULE_ANGLE_OFFSETS,
+                SH5_SWERVE_WHEEL_RADIUS,
+            ),
+            (
+                "SG2",
+                SG2_SWERVE_STEERING_JOINTS,
+                SG2_SWERVE_WHEEL_JOINTS,
+                SG2_SWERVE_MODULE_X_OFFSETS,
+                SG2_SWERVE_MODULE_Y_OFFSETS,
+                SG2_SWERVE_MODULE_ANGLE_OFFSETS,
+                SG2_SWERVE_WHEEL_RADIUS,
+            ),
+        )
+        for label, steering, wheels, x_off, y_off, ang_off, radius in profiles:
+            if all(j in names for j in steering) and all(j in names for j in wheels):
+                return label, steering, wheels, x_off, y_off, ang_off, radius
+        return None
+
+    def _init_swerve_drive(self) -> None:
+        """Set up the swerve controller (same stack as sh5_dds_bringup)."""
+        import sys
+        from pathlib import Path
+
+        bringup_dir = Path(__file__).resolve().parents[2] / "bringup"
+        if str(bringup_dir) not in sys.path:
+            sys.path.insert(0, str(bringup_dir))
+
+        from common import robotis_config as bringup_cfg
+        from common.swerve_drive import SwerveDriveController, SwerveModule
+
         robot = self.env.scene["robot"]
         joint_names = list(robot.data.joint_names)
         name_to_id = {name: idx for idx, name in enumerate(joint_names)}
+
+        profile = self._resolve_swerve_profile(joint_names)
+        if profile is None:
+            print("[Swerve] No matching swerve joint set in articulation; L-motion uses root teleport.")
+            self._use_swerve_l_motion = False
+            return
+
+        robot_label, steering_joints, wheel_joints, x_offsets, y_offsets, angle_offsets, wheel_radius = (
+            profile
+        )
 
         modules = [
             SwerveModule(
                 steering_joint=steering_joint,
                 wheel_joint=wheel_joint,
-                x_offset=SH5_SWERVE_MODULE_X_OFFSETS[index],
-                y_offset=SH5_SWERVE_MODULE_Y_OFFSETS[index],
-                angle_offset=SH5_SWERVE_MODULE_ANGLE_OFFSETS[index],
+                x_offset=x_offsets[index],
+                y_offset=y_offsets[index],
+                angle_offset=angle_offsets[index],
                 steering_limit_lower=bringup_cfg.AI_WORKER_SWERVE_STEERING_LIMIT_LOWER,
                 steering_limit_upper=bringup_cfg.AI_WORKER_SWERVE_STEERING_LIMIT_UPPER,
                 wheel_speed_limit_lower=bringup_cfg.AI_WORKER_SWERVE_WHEEL_SPEED_LIMIT_LOWER,
                 wheel_speed_limit_upper=bringup_cfg.AI_WORKER_SWERVE_WHEEL_SPEED_LIMIT_UPPER,
             )
-            for index, (steering_joint, wheel_joint) in enumerate(
-                zip(SH5_SWERVE_STEERING_JOINTS, SH5_SWERVE_WHEEL_JOINTS)
-            )
+            for index, (steering_joint, wheel_joint) in enumerate(zip(steering_joints, wheel_joints))
         ]
 
         missing = [
@@ -785,28 +1135,37 @@ class FFWSG2Sdk:
             if joint not in name_to_id
         ]
         if missing:
-            print(f"[SH5] Swerve joints missing from articulation {missing}; L-motion uses root teleport.")
+            print(f"[{robot_label}] Swerve joints missing from articulation {missing}; L-motion uses root teleport.")
             self._use_swerve_l_motion = False
             return
 
         self._swerve_steering_joint_ids = [name_to_id[m.steering_joint] for m in modules]
         self._swerve_wheel_joint_ids = [name_to_id[m.wheel_joint] for m in modules]
-        self._swerve_controller = SwerveDriveController(modules, SH5_SWERVE_WHEEL_RADIUS)
+        self._swerve_controller = SwerveDriveController(modules, wheel_radius)
         self._use_swerve_l_motion = True
-        print("[SH5] Swerve-drive L-motion enabled (cmd_vel-style base control).")
+        print(f"[{robot_label}] Swerve-drive L-motion enabled (cmd_vel-style base control).")
 
-    def _yaw_error(self, target_yaw: float) -> float:
-        current = self._get_robot_yaw()
-        return (target_yaw - current + math.pi) % (2.0 * math.pi) - math.pi
+    def _sim_step_dt(self) -> float:
+        """Environment step duration (physics dt * decimation), not wall clock."""
+        try:
+            return max(float(self.env.step_dt), 1.0e-3)
+        except AttributeError:
+            return 1.0 / 60.0
 
-    def _apply_swerve_cmd_vel(self, linear_x: float, linear_y: float, angular_z: float) -> None:
+    def _apply_swerve_cmd_vel(
+        self,
+        linear_x: float,
+        linear_y: float,
+        angular_z: float,
+        *,
+        integrate_root: bool = True,
+        dt=None,
+    ) -> None:
         if self._swerve_controller is None:
             return
 
         robot = self.env.scene["robot"]
-        now = time.monotonic()
-        dt = max(now - self._last_swerve_update_time, 1.0e-3)
-        self._last_swerve_update_time = now
+        step_dt = dt if dt is not None else self._sim_step_dt()
 
         current_steering = [
             float(v)
@@ -823,7 +1182,7 @@ class FFWSG2Sdk:
             angular_z,
             current_steering_positions=current_steering,
             current_wheel_velocities=current_wheel_velocities,
-            dt=dt,
+            dt=step_dt,
         )
 
         position_target = robot.data.joint_pos_target.clone()
@@ -838,17 +1197,16 @@ class FFWSG2Sdk:
         robot.set_joint_position_target(position_target)
         robot.set_joint_velocity_target(velocity_target)
 
-        # The recording env spawns the SH5 with gravity disabled, so the wheels
-        # spin without ground traction and the base would never move from
-        # friction alone. Integrate the commanded body twist into the root pose
-        # so the base actually drives, while the steering/wheel joint targets
-        # above still produce realistic swerve values in the recorded dataset.
+        if not integrate_root:
+            return
+
+        # Fallback path when not using the smooth S-curve pose driver.
         if (
             abs(linear_x) > 1.0e-4
             or abs(linear_y) > 1.0e-4
             or abs(angular_z) > 1.0e-4
         ):
-            self._integrate_swerve_root(linear_x, linear_y, angular_z, dt)
+            self._integrate_swerve_root(linear_x, linear_y, angular_z, step_dt)
 
     def _integrate_swerve_root(
         self, linear_x: float, linear_y: float, angular_z: float, dt: float
@@ -874,51 +1232,54 @@ class FFWSG2Sdk:
         root_pose = torch.cat([pos, quat], dim=-1)
         robot.write_root_pose_to_sim(root_pose, env_ids=env_ids)
         robot.write_root_velocity_to_sim(torch.zeros(1, 6, device=device), env_ids=env_ids)
-        self._carry_box_with_root()
+        self._apply_box_carry()
 
     def _step_swerve_l_motion(self) -> None:
         if self._swerve_phase is None:
-            self._apply_swerve_cmd_vel(0.0, 0.0, 0.0)
+            self._apply_swerve_cmd_vel(0.0, 0.0, 0.0, integrate_root=False)
             return
 
-        if self._swerve_phase == "rotate":
-            yaw_err = self._yaw_error(self._rotation_target_yaw)
-            if abs(yaw_err) < self._swerve_yaw_tol:
-                self._swerve_phase = "forward"
-                robot = self.env.scene["robot"]
-                pos = robot.data.root_pos_w[0].detach().cpu().tolist()
-                yaw = self._get_robot_yaw()
-                self._swerve_forward_start_xy = (pos[0], pos[1])
-                self._swerve_forward_dir_xy = (math.cos(yaw), math.sin(yaw))
-                print(f"[Control] Swerve: rotation done; driving toward the {self._l_motion_label}")
-                return
+        robot = self.env.scene["robot"]
+        step_dt = self._sim_step_dt()
 
-            angular_z = max(
-                -self._swerve_max_angular_z,
-                min(self._swerve_max_angular_z, 2.5 * yaw_err),
+        if self._swerve_phase == "rotate":
+            elapsed = time.monotonic() - self._rotation_start_time
+            alpha = self._smoothstep(min(elapsed / self._rotation_duration_s, 1.0))
+            target_yaw = self._lerp_yaw(
+                self._rotation_start_yaw, self._rotation_target_yaw, alpha
             )
-            self._apply_swerve_cmd_vel(0.0, 0.0, angular_z)
+            self._set_robot_pose(robot.data.root_pos_w[0:1].clone(), target_yaw)
+            self._apply_box_carry()
+            # Wheels stay still: base motion is kinematic root teleport. Spinning
+            # wheels here vibrates the arms and shakes the box out of the grippers.
+            self._apply_swerve_cmd_vel(
+                0.0, 0.0, 0.0, integrate_root=False, dt=step_dt
+            )
+
+            if alpha >= 1.0:
+                self._swerve_phase = "forward"
+                self._begin_forward_motion()
+                print(f"[Control] Swerve: rotation done; driving toward the {self._l_motion_label}")
             return
 
         if self._swerve_phase == "forward":
-            robot = self.env.scene["robot"]
-            pos = robot.data.root_pos_w[0].detach().cpu().tolist()
-            if self._swerve_forward_start_xy is None or self._swerve_forward_dir_xy is None:
-                self._swerve_phase = None
-                self._apply_swerve_cmd_vel(0.0, 0.0, 0.0)
-                return
+            elapsed = time.monotonic() - self._forward_start_time
+            alpha = self._smoothstep(min(elapsed / self._forward_duration_s, 1.0))
+            pos = self._forward_start_pos + alpha * (
+                self._forward_end_pos - self._forward_start_pos
+            )
+            self._set_robot_pose(pos, self._forward_yaw)
+            self._apply_box_carry()
 
-            dx = pos[0] - self._swerve_forward_start_xy[0]
-            dy = pos[1] - self._swerve_forward_start_xy[1]
-            traveled = dx * self._swerve_forward_dir_xy[0] + dy * self._swerve_forward_dir_xy[1]
-            if traveled >= self._forward_distance_m:
+            self._apply_swerve_cmd_vel(
+                0.0, 0.0, 0.0, integrate_root=False, dt=step_dt
+            )
+
+            if alpha >= 1.0:
                 self._swerve_phase = None
-                self._apply_swerve_cmd_vel(0.0, 0.0, 0.0)
+                self._carry_box = False
+                self._apply_swerve_cmd_vel(0.0, 0.0, 0.0, integrate_root=False)
                 print(f"[Control] Swerve: finished driving toward the {self._l_motion_label}")
-                return
-
-            linear_x = min(self._swerve_max_linear_x, max(0.05, 0.5 * (self._forward_distance_m - traveled)))
-            self._apply_swerve_cmd_vel(linear_x, 0.0, 0.0)
 
     def add_callback(self, key: str, func: Callable):
         """Add callback function for a specific key."""

@@ -95,6 +95,34 @@ class RateLimiter:
                 self.last_time += self.sleep_duration
 
 
+def kinematic_record_step(env, teleop_interface, actions) -> None:
+    """Record one demo frame during L-motion without PhysX (matches pre-B smoothness)."""
+    env.action_manager.process_action(actions.to(env.device))
+    teleop_interface.sync_kinematic_state()
+    env.recorder_manager.record_pre_step()
+    is_rendering = env.sim.has_gui() or env.sim.has_rtx_sensors()
+    env.scene.update(dt=env.physics_dt)
+    if is_rendering:
+        env.sim.render()
+    env.episode_length_buf += 1
+    env.common_step_counter += 1
+    if len(env.recorder_manager.active_terms) > 0:
+        env.obs_buf = env.observation_manager.compute(update_history=True)
+        env.recorder_manager.record_post_step()
+
+
+MIN_AUTO_SAVE_STEPS = 50
+SUCCESS_DEBOUNCE_FRAMES = 15
+
+
+def _buffered_episode_steps(env) -> int:
+    ep = env.recorder_manager._episodes.get(0)
+    if ep is None or ep.is_empty():
+        return 0
+    actions = ep.data.get("actions", [])
+    return len(actions) if isinstance(actions, list) else 0
+
+
 def main():
     """Running cyclo_lab teleoperation with cyclo_lab manipulation environment."""
 
@@ -113,6 +141,7 @@ def main():
     # modify configuration
     if hasattr(env_cfg.terminations, "time_out"):
         env_cfg.terminations.time_out = None
+    auto_success_term_cfg = getattr(env_cfg.terminations, "success", None)
     if hasattr(env_cfg.terminations, "success"):
         env_cfg.terminations.success = None
 
@@ -120,7 +149,10 @@ def main():
     env_cfg.recorders.dataset_filename = output_file_name
     if not hasattr(env_cfg.terminations, "success"):
         setattr(env_cfg.terminations, "success", None)
-    env_cfg.terminations.success = TerminationTermCfg(func=lambda env: torch.zeros(1, dtype=torch.bool, device=env.device))
+    disabled_success_term_cfg = TerminationTermCfg(
+        func=lambda env: torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+    )
+    env_cfg.terminations.success = disabled_success_term_cfg
     # Do not save while stepping; only save explicitly on success (key 'N')
     env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_NONE
 
@@ -177,6 +209,43 @@ def main():
     current_recorded_demo_count = 0
 
     start_record_state = False
+    success_streak = 0
+
+    def maybe_auto_save_on_success() -> None:
+        """Poll task success while recording (even between teleop frames)."""
+        nonlocal success_streak
+        if (
+            not start_record_state
+            or auto_success_term_cfg is None
+            or should_reset_task_success
+            or should_reset_recording_instance
+        ):
+            success_streak = 0
+            return
+
+        if _buffered_episode_steps(env) < MIN_AUTO_SAVE_STEPS:
+            success_streak = 0
+            return
+
+        env.termination_manager.set_term_cfg("success", auto_success_term_cfg)
+        env.termination_manager.compute()
+        success_now = bool(env.termination_manager.get_term("success")[0].item())
+        env.termination_manager.set_term_cfg("success", disabled_success_term_cfg)
+
+        if success_now:
+            success_streak += 1
+        else:
+            success_streak = 0
+            return
+
+        if success_streak < SUCCESS_DEBOUNCE_FRAMES:
+            return
+
+        print("Task success detected — auto-saving episode")
+        success_streak = 0
+        if hasattr(teleop_interface, "on_episode_saved"):
+            teleop_interface.on_episode_saved()
+        reset_task_success()
 
     # simulate environment
     while simulation_app.is_running():
@@ -199,7 +268,11 @@ def main():
                     print(f"Exception details: {type(e).__name__}: {str(e)}")
 
                 env.recorder_manager.cfg.dataset_export_mode = DatasetExportMode.EXPORT_ALL
-                env.recorder_manager.export_episodes(from_step=False)
+                try:
+                    env.recorder_manager.export_episodes(from_step=False)
+                except Exception as e:
+                    print(f"Warning: Failed to export episode: {e}")
+                    print(f"Exception details: {type(e).__name__}: {str(e)}")
                 env.recorder_manager.cfg.dataset_export_mode = DatasetExportMode.EXPORT_NONE
                 # Update and report successful demo count immediately after export
                 if env.recorder_manager.exported_successful_episode_count > current_recorded_demo_count:
@@ -214,22 +287,32 @@ def main():
                     print(f"Exception details: {type(e).__name__}: {str(e)}")
 
                 env.reset()
+                teleop_interface.reset()
+                success_streak = 0
                 should_reset_recording_instance = False
                 if start_record_state:
                     print("Stop Recording!!!")
                 start_record_state = False
-                env.termination_manager.set_term_cfg("success", TerminationTermCfg(func=lambda env: torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)))
+                env.termination_manager.set_term_cfg("success", disabled_success_term_cfg)
                 # print out the current demo count if it has changed
                 print(f"Resetting recording instance. Current recorded demo count: {current_recorded_demo_count}")
                 if env.recorder_manager.exported_successful_episode_count > current_recorded_demo_count:
                     current_recorded_demo_count = env.recorder_manager.exported_successful_episode_count
                     print(f"Recorded {current_recorded_demo_count} successful demonstrations.")
                 if args_cli.num_demos > 0 and env.recorder_manager.exported_successful_episode_count >= args_cli.num_demos:
-                    print(f"All {args_cli.num_demos} demonstrations recorded. Exiting the app.")
+                    print(
+                        f"\n{'=' * 60}\n"
+                        f"All {args_cli.num_demos} demonstrations recorded — exiting Isaac.\n"
+                        f"This is normal (not a crash). Relaunch from the dashboard to record more.\n"
+                        f"Tip: set NUM_DEMOS=0 on the dashboard for unlimited recording.\n"
+                        f"{'=' * 60}\n",
+                        flush=True,
+                    )
                     break
 
             elif actions is None:
                 env.render()
+                maybe_auto_save_on_success()
             # apply actions
             else:
                 if isinstance(actions, dict):
@@ -245,7 +328,17 @@ def main():
                     if not start_record_state:
                         print("Start Recording!!!")
                         start_record_state = True
-                    env.step(actions)
+                    kinematic_l = (
+                        hasattr(teleop_interface, "use_kinematic_l_record_step")
+                        and teleop_interface.use_kinematic_l_record_step()
+                    )
+                    if kinematic_l:
+                        kinematic_record_step(env, teleop_interface, actions)
+                    else:
+                        env.step(actions)
+                        if hasattr(teleop_interface, "after_env_step"):
+                            teleop_interface.after_env_step()
+                    maybe_auto_save_on_success()
             if rate_limiter:
                 rate_limiter.sleep(env)
 

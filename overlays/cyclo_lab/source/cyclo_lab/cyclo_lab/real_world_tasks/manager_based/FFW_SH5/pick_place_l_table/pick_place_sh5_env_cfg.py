@@ -31,6 +31,10 @@ from isaaclab.utils import configclass
 from isaaclab.sensors import CameraCfg
 
 from . import mdp
+from cyclo_lab.real_world_tasks.manager_based.FFW_SG2.pick_place_l_table.mdp.ffw_sg2_l_table_events import (
+    LEFT_TABLE_DROP_HEIGHT_TOLERANCE,
+    LEFT_TABLE_EDGE_MARGIN,
+)
 from cyclo_lab.real_world_tasks.manager_based.FFW_SH5._shared import (
     init_sh5_action_cfg,
     policy_joint_obs_params,
@@ -51,6 +55,7 @@ class LTableSceneCfg(InteractiveSceneCfg):
     table_left: AssetBaseCfg = MISSING
     cardboard_box: AssetBaseCfg = MISSING
     box_riser: AssetBaseCfg = MISSING
+    drop_zone_marker: AssetBaseCfg | None = None
     cam_head: CameraCfg = MISSING
 
     plane = AssetBaseCfg(
@@ -118,6 +123,8 @@ class ObservationsCfg:
                 "left_eef_cfg": SceneEntityCfg("left_eef"),
                 "right_eef_cfg": SceneEntityCfg("right_eef"),
                 "object_cfg": SceneEntityCfg("cardboard_box"),
+                "diff_threshold": 0.20,
+                "finger_close_threshold": 0.12,
             },
         )
         box_on_left_table = ObsTerm(
@@ -125,7 +132,8 @@ class ObservationsCfg:
             params={
                 "object_cfg": SceneEntityCfg("cardboard_box"),
                 "table_left_cfg": SceneEntityCfg("table_left"),
-                "distance_threshold": 0.12,
+                "edge_margin": LEFT_TABLE_EDGE_MARGIN,
+                "height_tolerance": LEFT_TABLE_DROP_HEIGHT_TOLERANCE,
             },
         )
 
@@ -145,7 +153,8 @@ class TerminationsCfg:
         params={
             "object_cfg": SceneEntityCfg("cardboard_box"),
             "table_left_cfg": SceneEntityCfg("table_left"),
-            "distance_threshold": 0.12,
+            "edge_margin": LEFT_TABLE_EDGE_MARGIN,
+            "height_tolerance": LEFT_TABLE_DROP_HEIGHT_TOLERANCE,
         },
     )
     object_dropped = DoneTerm(
@@ -159,7 +168,7 @@ class TerminationsCfg:
 
 @configclass
 class PickPlaceLTableSH5EnvCfg(ManagerBasedRLEnvCfg):
-    """Dual-gripper box pick from front table and place on left table."""
+    """Dual-hand box pick from front table and place on left table."""
 
     scene: LTableSceneCfg = LTableSceneCfg(num_envs=4096, env_spacing=3.0, replicate_physics=False)
     observations: ObservationsCfg = ObservationsCfg()
@@ -172,7 +181,13 @@ class PickPlaceLTableSH5EnvCfg(ManagerBasedRLEnvCfg):
     events = None
     curriculum = None
 
-    teleop_l_use_swerve: bool = True
+    teleop_l_use_swerve: bool = False
+    teleop_auto_l_on_grip_s: float = 2.0
+    teleop_lift_min: float = -0.40
+    teleop_lift_max: float = 0.0
+    teleop_sh5_finger_hold_alpha: float = 0.42
+    teleop_sh5_finger_hold_alpha_firm: float = 0.68
+    teleop_sh5_finger_hold_alpha_carry: float = 0.82
 
     def __post_init__(self):
         self.decimation = 5

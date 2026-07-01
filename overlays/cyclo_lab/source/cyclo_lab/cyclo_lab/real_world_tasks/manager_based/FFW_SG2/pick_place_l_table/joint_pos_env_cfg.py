@@ -28,6 +28,7 @@ from cyclo_lab.assets.robots.FFW_SG2 import FFW_SG2_CFG  # isort: skip
 from cyclo_lab.assets.object.table_prim import TABLE_FRONT_CFG, TABLE_LEFT_CFG
 from cyclo_lab.assets.object.cardboard_box import CARDBOARD_BOX_CFG
 from cyclo_lab.assets.object.box_riser import BOX_RISER_CFG
+from cyclo_lab.assets.object.drop_zone_marker import L_TABLE_DROP_ZONE_MARKER_CFG
 
 
 @configclass
@@ -119,6 +120,9 @@ class FFWSG2PickPlaceLTableEnvCfg(PickPlaceLTableEnvCfg):
         self.scene.table_left = TABLE_LEFT_CFG.replace(prim_path="{ENV_REGEX_NS}/TableLeft")
         self.scene.cardboard_box = CARDBOARD_BOX_CFG.replace(prim_path="{ENV_REGEX_NS}/CardboardBox")
         self.scene.box_riser = BOX_RISER_CFG.replace(prim_path="{ENV_REGEX_NS}/BoxRiser")
+        self.scene.drop_zone_marker = L_TABLE_DROP_ZONE_MARKER_CFG.replace(
+            prim_path="{ENV_REGEX_NS}/DropZoneMarker"
+        )
         self.scene.plane.semantic_tags = [("class", "ground")]
 
         self.scene.cam_head = CameraCfg(
