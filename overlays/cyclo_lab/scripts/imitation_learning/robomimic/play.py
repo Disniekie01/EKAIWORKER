@@ -40,6 +40,31 @@ parser.add_argument(
 parser.add_argument(
     "--norm_factor_max", type=float, default=None, help="Optional: maximum value of the normalization factor."
 )
+parser.add_argument(
+    "--action_mode",
+    type=str,
+    default="inference",
+    choices=["record", "inference", "mimic_ik"],
+    help="Action space mode for envs that define init_action_cfg (joint vs IK).",
+)
+parser.add_argument(
+    "--remap_ffw_sg2_actions",
+    action="store_true",
+    default=False,
+    help="Swap head/lift action indices for FFW-SG2 joint HDF5 datasets (19-dim).",
+)
+parser.add_argument(
+    "--no_remap_ffw_sg2_actions",
+    action="store_true",
+    default=False,
+    help="Disable automatic FFW-SG2 head/lift action remapping.",
+)
+parser.add_argument(
+    "--scripted_l_motion",
+    action="store_true",
+    default=False,
+    help="Enable scripted base L-motion during play (policy controls manipulation).",
+)
 parser.add_argument("--enable_pinocchio", default=False, action="store_true", help="Enable Pinocchio.")
 
 
@@ -72,6 +97,27 @@ if args_cli.enable_pinocchio:
 from isaaclab_tasks.utils import parse_env_cfg
 
 import cyclo_lab  # noqa: F401
+from cyclo_lab.real_world_tasks.manager_based.FFW_SG2.pick_place_l_table.ltable_kinematic_l_motion import (
+    LTableKinematicLMotion,
+)
+
+_FFW_SG2_JOINT_ACTION_DIM = 19
+
+
+def remap_ffw_sg2_joint_actions_to_env(actions):
+    """Swap head/lift slots from joint_pos_target layout to ActionManager layout.
+
+    Training HDF5 (joint convert) stores actions in observation order:
+      [..., head_joint1, lift_joint, head_joint2]
+    while ActionManager applies:
+      [..., lift_joint, head_joint1, head_joint2]
+    """
+    if actions.shape[-1] != _FFW_SG2_JOINT_ACTION_DIM:
+        return actions
+    mapped = actions.copy()
+    mapped[..., 16] = actions[..., 17]
+    mapped[..., 17] = actions[..., 16]
+    return mapped
 
 
 def rollout(policy, env, success_term, horizon, device):
@@ -90,6 +136,8 @@ def rollout(policy, env, success_term, horizon, device):
     policy.start_episode()
     obs_dict, _ = env.reset()
     traj = dict(actions=[], obs=[], next_obs=[])
+    l_motion_ctrl = LTableKinematicLMotion(env) if args_cli.scripted_l_motion else None
+    l_motion_prev_active = False
 
     for i in range(horizon):
         # Prepare observations
@@ -119,6 +167,9 @@ def rollout(policy, env, success_term, horizon, device):
         # Compute actions
         actions = policy(obs)
 
+        if args_cli.remap_ffw_sg2_actions:
+            actions = remap_ffw_sg2_joint_actions_to_env(actions)
+
         # Unnormalize actions
         if args_cli.norm_factor_min is not None and args_cli.norm_factor_max is not None:
             actions = (
@@ -130,6 +181,14 @@ def rollout(policy, env, success_term, horizon, device):
         # Apply actions
         obs_dict, _, terminated, truncated, _ = env.step(actions)
         obs = obs_dict["policy"]
+        if l_motion_ctrl is not None:
+            env_ids = torch.arange(env.num_envs, device=env.device)
+            l_motion_ctrl.step_interval(env_ids)
+            if l_motion_ctrl.is_active() and not l_motion_prev_active:
+                print(f"[INFO] Scripted L-motion started at step {i}")
+            if l_motion_ctrl.is_done() and l_motion_prev_active:
+                print(f"[INFO] Scripted L-motion completed at step {i}")
+            l_motion_prev_active = l_motion_ctrl.is_active()
 
         # Record trajectory
         traj["actions"].append(actions.tolist())
@@ -146,8 +205,17 @@ def rollout(policy, env, success_term, horizon, device):
 
 def main():
     """Run a trained policy from robomimic with Isaac Lab environment."""
+    if args_cli.no_remap_ffw_sg2_actions:
+        args_cli.remap_ffw_sg2_actions = False
+    elif args_cli.remap_ffw_sg2_actions:
+        pass
+    elif args_cli.task and "FFW-SG2" in args_cli.task:
+        args_cli.remap_ffw_sg2_actions = True
+
     # parse configuration
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1, use_fabric=not args_cli.disable_fabric)
+    if hasattr(env_cfg, "init_action_cfg"):
+        env_cfg.init_action_cfg(args_cli.action_mode)
 
     # Set observations to dictionary mode for Robomimic
     env_cfg.observations.policy.concatenate_terms = False

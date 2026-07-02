@@ -208,6 +208,25 @@ python scripts/sim2real/imitation_learning/inference/inference_demos.py \
 
 SG2: `--robot_type FFW_SG2` and the matching `Cyclo-Real-*-FFW-SG2-v0` task id.
 
+### Robomimic play (L-table, SG2)
+
+For L-table policy evaluation, use robomimic play with SG2 action remap and optional scripted base L-motion:
+
+```bash
+python scripts/imitation_learning/robomimic/play.py \
+  --device cuda \
+  --task Cyclo-Real-Pick-Place-LTable-FFW-SG2-v0 \
+  --checkpoint /PATH/TO/model_epoch_20.pth \
+  --num_rollouts 10 --horizon 2000 \
+  --enable_cameras --action_mode inference \
+  --scripted_l_motion
+```
+
+Flags:
+- `--action_mode inference`: initializes SG2 real-task action terms
+- `--remap_ffw_sg2_actions`: swaps head/lift action indices for SG2 19-dim joint datasets
+- `--scripted_l_motion`: runs base rotate+forward L-motion in play after grasp latch
+
 ## Overlay Sync
 
 `overlays/cyclo_lab/` is the source of truth for AIWORKER changes.
