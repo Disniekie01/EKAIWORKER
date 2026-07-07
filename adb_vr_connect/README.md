@@ -102,7 +102,7 @@ If it shows `device` (not `no permission` or `unauthorized`), one-time setup is 
 The `connect.sh` script (see below) handles the steps you'll repeat every session. Make it executable once:
 
 ```bash
-chmod +x connect.sh
+chmod +x ~/AIWORKER/adb_vr_connect/connect.sh
 ```
 
 ---
@@ -125,7 +125,7 @@ Choose one:
 ### 3. Run the tethering script
 
 ```bash
-./connect.sh
+~/AIWORKER/adb_vr_connect/connect.sh
 ```
 
 This waits for the device and sets up `adb reverse` port forwarding (it resets every time the cable is unplugged, so this needs to run each session).
@@ -162,4 +162,4 @@ Move your hand quickly and compare the robot arm's response delay against the Wi
 | `unauthorized` | USB debugging prompt not confirmed in headset | Check the prompt while wearing the headset, or run `adb kill-server && adb start-server` |
 | `no permission` | Missing udev rule | Follow the udev rule setup steps in Part 1 |
 | Mixed-content error in Quest browser | Mixing `ws://` and `wss://` on the local page | Make sure the local Vuer server's WebSocket also uses `wss://`, matching the page's `https://` |
-| Port forwarding lost after reconnecting cable | `adb reverse` resets on disconnect | Re-run `./connect.sh` |
+| Port forwarding lost after reconnecting cable | `adb reverse` resets on disconnect | Re-run `~/AIWORKER/adb_vr_connect/connect.sh` |

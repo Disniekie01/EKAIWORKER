@@ -42,6 +42,8 @@ python3 sg2_ltable_dashboard.py
 
 Open: `http://localhost:8765`
 
+Select a task, click **Launch VR + Controller**, then connect the headset — see [VR Teleoperation](#vr-teleoperation--how-to-connect) for the full Vuer URL (`https://<host-ip>:8012?ws=wss://<host-ip>:8012`).
+
 ### 5) Run first SG2 L-table play test
 
 ```bash
@@ -77,7 +79,7 @@ cd ~/AIWORKER/cyclo_lab
 python3 sg2_ltable_dashboard.py
 ```
 
-Open `http://localhost:8765`, select your task, launch the stack, and record demos.
+Open `http://localhost:8765`, select your task, launch the stack, connect VR (see [VR Teleoperation](#vr-teleoperation--how-to-connect)), and record demos.
 
 Recorder controls in Isaac window:
 - `B` start recording
@@ -133,6 +135,7 @@ cd /workspace/cyclo_lab
 - SH5 DDS recorder support for VR hand teleoperation.
 - Task-specific table/box assets and teleop motion settings.
 - Minor `robotis_applications` VR publisher update used by this setup.
+- `adb_vr_connect/` — Meta Quest 3 USB tethering via ADB reverse port forwarding (lower jitter than WiFi).
 
 ## Upstream Pins
 
@@ -213,28 +216,96 @@ export PIPELINE_NUM_ENVS=10        # parallel Isaac envs during datagen (default
 
 HDF5 paths are derived from the task raw dataset name (e.g. `ffw_sg2_l_table_raw.hdf5` → `ffw_sg2_l_table_ik.hdf5`, etc.). The dashboard uses each task's `mimic_id` for annotate/datagen and the record task id for LeRobot export.
 
-## VR Notes
+## VR Teleoperation — How to Connect
 
-For SH5 hand tasks, the dashboard launches:
+VR teleop uses **Vuer** (WebXR) in the Meta Quest browser. The dashboard starts the full stack; you open Vuer on the headset and control the sim robot from there.
 
-- `robotis_vuer vr.launch.py model:=sh5`
-- `cyclo_motion_controller_ros ai_worker_controller.launch.py controller_type:=vr hand:=true`
+### URLs and ports
 
-VR lift publishing is disabled for hand tasks. Adjust lift from the Isaac Sim window with **I** (up) and **O** (down); range is about **−0.40 m to 0.0 m** (reset pose starts around −0.25 m).
+| Service | Address | Purpose |
+|---------|---------|---------|
+| **Dashboard** | `http://localhost:8765` | Task picker, launch VR/controller/recorder, mimic pipeline |
+| **Vuer (HTTPS)** | `https://<host-ip>:8012` | WebXR page served by `robotis_vuer` |
+| **Vuer (WebSocket)** | `wss://<host-ip>:8012` | Pose/button stream (must use `wss://` with `https://`) |
 
-L-motion on both SG2 and SH5 uses kinematic root teleport (swerve wheels off) so carried boxes stay stable during recording. After gripping a box for ~2 s, L-motion can auto-start when `teleop_auto_l_on_grip_s` is set on the task.
+Replace `<host-ip>` with your PC’s LAN address. The dashboard prints it after **Launch VR + Controller** or **Launch Record** (first address from `hostname -I`, e.g. `192.168.1.42`).
 
-Recording controls (Isaac window focus): **B** start, **L** L-motion, **N** save episode, **R** reset/skip. When the env `success` termination fires (box placed), the recorder also auto-saves if **B** is active.
-
-The dashboard recorder runs inside the Isaac container at `/workspace/cyclo_lab`. Ensure that path mounts your synced `cyclo_lab` checkout (host edits must be visible there).
+**Full URL to open in Meta Quest Browser (WiFi / same LAN):**
 
 ```text
-https://<host-ip>:8012
+https://<host-ip>:8012?ws=wss://<host-ip>:8012
 ```
 
-The headset page is printed by the dashboard. It normally looks like the URL above.
+Example:
 
-For hand tasks, VR publishing starts disabled by default. Enable it with the SH5 gesture or publish the override:
+```text
+https://192.168.1.42:8012?ws=wss://192.168.1.42:8012
+```
+
+**USB tethered Quest (ADB reverse — use `localhost` on both):**
+
+```text
+https://localhost:8012?ws=wss://localhost:8012
+```
+
+See [Meta Quest 3 USB (ADB) setup](adb_vr_connect/README.md) for one-time ADB/udev setup and the per-session `adb_vr_connect/connect.sh` script.
+
+### What the dashboard launches
+
+Containers (all must be running):
+
+| Container | Role |
+|-----------|------|
+| `cyclo_lab` | Isaac Sim recorder / mimic pipeline |
+| `robotis-applications` | Vuer VR publisher (`ros2 launch robotis_vuer vr.launch.py`, port **8012**) |
+| `ai_worker` | Motion controller (`cyclo_motion_controller_ros`, `controller_type:=vr`) |
+
+Robot-specific launch (picked automatically from task):
+
+| Robot | VR model | Controller | Notes |
+|-------|----------|------------|-------|
+| **SG2 (gripper)** | `model:=sg2` | `hand:=false` | Lift on right thumbstick |
+| **SH5 (hands)** | `model:=sh5` | `hand:=true` | VR lift publishing off; use **I**/**O** in Isaac |
+
+`ROS_DOMAIN_ID=30` (default). Optional: `VR_IMAGE=1` before starting the dashboard enables stereo passthrough background in the headset.
+
+### WiFi connection (every session)
+
+1. Start all three containers (see [Start Containers](#start-containers)).
+2. Enable GUI: `xhost +local:docker` (and `xhost +` if Isaac window fails).
+3. Start the dashboard: `python3 sg2_ltable_dashboard.py` → open `http://localhost:8765`.
+4. Select **Robot** and **Task**.
+5. Click **Launch VR + Controller** (teleop only) or **Launch Record** (teleop + Isaac recorder).
+6. Wait until dashboard shows `vr: running` and `ai: running`, and the **Vuer** link appears.
+7. On the Quest (same WiFi as the PC), open **Meta Quest Browser** and paste the full URL:
+   `https://<host-ip>:8012?ws=wss://<host-ip>:8012`
+8. Accept the self-signed certificate: **Advanced → Proceed (unsafe)** (may appear twice — page and WebSocket).
+9. Click **Enter VR** and allow hand tracking.
+10. Confirm the Vuer terminal log in the `robotis-applications` container shows a client connected.
+
+### USB / ADB connection (recommended for recording)
+
+Lower latency jitter than WiFi; no router between Quest and PC.
+
+1. Complete [one-time ADB setup](adb_vr_connect/README.md) (udev rule, USB debugging).
+2. Plug Quest into the PC with a **USB 3.0 data cable**.
+3. Start Vuer from the dashboard (**Launch VR + Controller** or **Launch Record**).
+4. Run the tether script:
+   ```bash
+   cd ~/AIWORKER/adb_vr_connect
+   ./connect.sh
+   ```
+5. In Meta Quest Browser open:
+   `https://localhost:8012?ws=wss://localhost:8012`
+6. Accept cert → **Enter VR** → allow hand tracking.
+
+Re-run `./connect.sh` after every USB reconnect (`adb reverse` resets on unplug).
+
+### Enable robot control after connecting
+
+**SG2 (gripper):** Squeeze **both** controller grips to enable VR publishing.
+
+**SH5 (hands):** VR publishing starts **disabled**. Enable with the SH5 hand gesture, or:
 
 ```bash
 docker exec -it robotis-applications bash
@@ -243,6 +314,40 @@ source /opt/ros/jazzy/setup.bash
 source /root/ros2_ws/install/setup.bash
 ros2 topic pub --once /vr/reactivate std_msgs/msg/Bool "{data: true}"
 ```
+
+**SH5 lift:** VR does not publish lift for hand tasks. Adjust from the Isaac Sim window: **I** (up) / **O** (down), range about **−0.40 m to 0.0 m** (reset pose ~−0.25 m).
+
+**SG2 lift:** Right thumbstick on the VR controller.
+
+### Recording demos (Isaac window focus)
+
+| Key | Action |
+|-----|--------|
+| **B** | Start / stop recording |
+| **N** | Save episode (manual mode) |
+| **R** | Reset / skip episode |
+| **L** | Trigger L-motion (rotate + drive to table) |
+
+L-motion uses kinematic root teleport (swerve off) so carried boxes stay stable. After gripping ~2 s, L-motion can auto-start when `teleop_auto_l_on_grip_s` is set on the task.
+
+When the env `success` termination fires (box placed), the recorder auto-saves if **B** is active and dashboard **Save episode** is set to **Auto on task success**.
+
+Raw datasets are written to `~/AIWORKER/cyclo_lab/datasets/*_raw.hdf5`. The recorder runs inside the `cyclo_lab` container at `/workspace/cyclo_lab` — host edits must be visible there (sync overlay if needed).
+
+### VR troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| Quest cannot reach Vuer | Same WiFi as PC; check firewall on port **8012**; confirm `robotis-applications` container is up |
+| Mixed-content / WebSocket error | Use `wss://` in `ws=` when the page is `https://` |
+| Certificate warning | **Advanced → Proceed** on Quest browser |
+| Robot does not move (SH5) | Enable publishing (gesture or `/vr/reactivate`) |
+| Robot does not move (SG2) | Squeeze both grips |
+| Stuttery teleop on WiFi | Switch to [USB ADB tethering](adb_vr_connect/README.md) |
+| `adb devices` shows `no permission` | Follow udev steps in `adb_vr_connect/README.md` |
+| Isaac GUI missing | `xhost +` on host, `DISPLAY=:1` in container |
+
+ROBOTIS upstream reference: [VR teleoperation guide](https://docs.robotis.com/docs/systems/aiworker/quick_start_guide/operation_guide/vr_teleoperation).
 
 ## Datasets
 
