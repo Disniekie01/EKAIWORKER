@@ -1,6 +1,6 @@
-# Meta Quest 3 Wired Connection (ADB Reverse Tethering) Setup Guide
+# Meta Quest 3 Connection (ADB Reverse Tethering) Setup Guide
 
-This guide covers connecting a Meta Quest 3 to a PC (DGX Spark) via USB-C cable instead of WiFi for a Vuer (WebXR) based VR teleoperation system, using ADB reverse port forwarding to eliminate WiFi latency jitter.
+This guide covers connecting a Meta Quest 3 to a PC via USB-C cable instead of WiFi or an ethernet cable for a Vuer (WebXR) based VR teleoperation system, using ADB reverse port forwarding to eliminate WiFi latency jitter. Unlike a wired LAN setup, this needs no router or switch between the two devices — the USB-C cable alone connects them directly.
 
 ## Background
 
@@ -15,7 +15,7 @@ This guide covers connecting a Meta Quest 3 to a PC (DGX Spark) via USB-C cable 
 
 Do this once per machine. No need to repeat it for every session.
 
-### 1. Install ADB on the PC (DGX Spark)
+### 1. Install ADB on the PC
 
 ```bash
 sudo apt update
@@ -95,14 +95,14 @@ List of devices attached
 2833:5013	device
 ```
 
-If it shows `device` (not `no permission` or `unauthorized`), one-time setup is complete.
+If it shows `device` (not `no permission` or `unauthorized`), one-time setup is complete. Otherwise, see the Troubleshooting table at the bottom of this guide.
 
 ### 6. Make the tethering script executable
 
-The `quest_tether.sh` script (see below) handles the steps you'll repeat every session. Make it executable once:
+The `connect.sh` script (see below) handles the steps you'll repeat every session. Make it executable once:
 
 ```bash
-chmod +x quest_tether.sh
+chmod +x connect.sh
 ```
 
 ---
@@ -117,16 +117,15 @@ Connect Quest 3 to the PC.
 
 ### 2. Start the Vuer server
 
-```bash
-grep -rn "port" your_vuer_script.py   # confirm the port if unsure — default is 8012
-```
+Choose one:
 
-Run your teleoperation/Vuer script as usual.
+- **Option 1** — Follow the [ROBOTIS documentation](https://docs.robotis.com/docs/systems/aiworker/quick_start_guide/operation_guide/vr_teleoperation#3-start-vr-publisher-node) ("3. Start VR Publisher Node").
+- **Option 2** — Click **"Launch VR + Controller"** on the dashboard. See [repo root README, "4) Start dashboard"](../README.md#4-start-dashboard) for how to start it.
 
 ### 3. Run the tethering script
 
 ```bash
-./quest_tether.sh
+./connect.sh
 ```
 
 This waits for the device and sets up `adb reverse` port forwarding (it resets every time the cable is unplugged, so this needs to run each session).
@@ -163,4 +162,4 @@ Move your hand quickly and compare the robot arm's response delay against the Wi
 | `unauthorized` | USB debugging prompt not confirmed in headset | Check the prompt while wearing the headset, or run `adb kill-server && adb start-server` |
 | `no permission` | Missing udev rule | Follow the udev rule setup steps in Part 1 |
 | Mixed-content error in Quest browser | Mixing `ws://` and `wss://` on the local page | Make sure the local Vuer server's WebSocket also uses `wss://`, matching the page's `https://` |
-| Port forwarding lost after reconnecting cable | `adb reverse` resets on disconnect | Re-run `./quest_tether.sh` |
+| Port forwarding lost after reconnecting cable | `adb reverse` resets on disconnect | Re-run `./connect.sh` |
