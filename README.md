@@ -42,7 +42,7 @@ python3 sg2_ltable_dashboard.py
 
 Open: `http://localhost:8765`
 
-Select a task, click **Launch VR + Controller**, then connect the headset — see [VR Teleoperation](#vr-teleoperation--how-to-connect) for the full Vuer URL (`https://<host-ip>:8012?ws=wss://<host-ip>:8012`).
+Select a task, click **Launch VR + Controller**, then follow the **Meta Quest — headset connection** steps on the dashboard (cert at `https://<host-ip>:8012`, then `https://vuer.ai/?ws=wss://<host-ip>:8012` in a new tab).
 
 ### 5) Run first SG2 L-table play test
 
@@ -186,13 +186,14 @@ Open the dashboard at:
 http://localhost:8765
 ```
 
-**Paste this in Meta Quest Browser (WiFi, same LAN as PC):**
+**Paste in Meta Quest Browser (WiFi) — two steps:**
 
 ```text
-https://<host-ip>:8012?ws=wss://<host-ip>:8012
+Step 1 (accept cert):  https://<host-ip>:8012
+Step 2 (new tab, VR):  https://vuer.ai/?ws=wss://<host-ip>:8012
 ```
 
-Replace `<host-ip>` with your PC IP (dashboard prints the full URL after **Launch VR + Controller**). For USB tethering use `https://localhost:8012?ws=wss://localhost:8012` — see [VR Teleoperation](#vr-teleoperation--how-to-connect).
+The dashboard **Meta Quest — headset connection** box shows your PC IP after **Launch VR + Controller**. USB/ADB uses `localhost` — see [VR Teleoperation](#vr-teleoperation--how-to-connect).
 
 Select the task, then launch the stack from the dashboard.
 
@@ -236,29 +237,29 @@ VR teleop uses **Vuer** (WebXR) in the Meta Quest browser. The dashboard starts 
 | **Vuer (HTTPS)** | `https://<host-ip>:8012` | WebXR page served by `robotis_vuer` |
 | **Vuer (WebSocket)** | `wss://<host-ip>:8012` | Pose/button stream (must use `wss://` with `https://`) |
 
-Replace `<host-ip>` with your PC’s LAN address. The dashboard prints it after **Launch VR + Controller** or **Launch Record** (first address from `hostname -I`, e.g. `192.168.1.42`).
+Replace `<host-ip>` with your PC’s LAN address. The dashboard prints it after **Launch VR + Controller** (first address from `hostname -I`, e.g. `192.168.1.42`).
 
-**Full URL to open in Meta Quest Browser (WiFi / same LAN):**
+**WiFi — two steps in Meta Quest Browser:**
 
-```text
-https://<host-ip>:8012?ws=wss://<host-ip>:8012
-```
+1. **Accept certificate** — open `https://<host-ip>:8012` → **Advanced → Proceed (unsafe)**
+2. **New tab** — open the Vuer client (connects WebSocket to your PC):
+   ```text
+   https://vuer.ai/?ws=wss://<host-ip>:8012
+   ```
+3. **Enter VR** → allow hand tracking
 
-This is the address you need — both the page **and** the `ws=` parameter must use the same host (`<host-ip>` or `localhost` for USB).
-
-Example:
-
-```text
-https://192.168.1.42:8012?ws=wss://192.168.1.42:8012
-```
-
-**USB tethered Quest (ADB reverse — use `localhost` on both):**
+Example step 2:
 
 ```text
-https://localhost:8012?ws=wss://localhost:8012
+https://vuer.ai/?ws=wss://192.168.1.42:8012
 ```
 
-See [Meta Quest 3 USB (ADB) setup](adb_vr_connect/README.md) for one-time ADB/udev setup and the per-session `adb_vr_connect/connect.sh` script.
+**USB tethered Quest (ADB reverse — offline, no vuer.ai):**
+
+1. Accept cert at `https://localhost:8012`
+2. New tab: `https://localhost:8012?ws=wss://localhost:8012`
+
+See [Meta Quest 3 USB (ADB) setup](adb_vr_connect/README.md) for one-time ADB/udev setup and `adb_vr_connect/connect.sh`.
 
 ### What the dashboard launches
 
@@ -286,10 +287,9 @@ Robot-specific launch (picked automatically from task):
 3. Start the dashboard: `python3 sg2_ltable_dashboard.py` → open `http://localhost:8765`.
 4. Select **Robot** and **Task**.
 5. Click **Launch VR + Controller** (teleop only) or **Launch Record** (teleop + Isaac recorder).
-6. Wait until dashboard shows `vr: running` and `ai: running`, and the **Vuer** link appears.
-7. On the Quest (same WiFi as the PC), open **Meta Quest Browser** and paste the full URL:
-   `https://<host-ip>:8012?ws=wss://<host-ip>:8012`
-8. Accept the self-signed certificate: **Advanced → Proceed (unsafe)** (may appear twice — page and WebSocket).
+6. Wait until dashboard shows `vr: running` and `ai: running`, and the **Meta Quest — headset connection** box appears.
+7. On the Quest (same WiFi), **Step 1:** open `https://<host-ip>:8012` → accept certificate.
+8. **Step 2:** new browser tab → `https://vuer.ai/?ws=wss://<host-ip>:8012`
 9. Click **Enter VR** and allow hand tracking.
 10. Confirm the Vuer terminal log in the `robotis-applications` container shows a client connected.
 

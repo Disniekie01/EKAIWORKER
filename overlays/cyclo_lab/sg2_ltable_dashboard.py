@@ -250,14 +250,19 @@ def _host_ip() -> str:
 
 
 def _vuer_urls(host: str | None = None) -> dict[str, str]:
-    """Vuer page + WebSocket URLs. Quest browser needs the combined ?ws= form."""
+    """Vuer cert + headset URLs. Quest: accept cert on :8012, then open vuer.ai with ws=."""
     host = host or _host_ip()
-    base = f"https://{host}:8012"
     ws = f"wss://{host}:8012"
+    cert = f"https://{host}:8012"
     return {
-        "vuer_url": base,
+        "vuer_url": cert,
         "vuer_ws": ws,
-        "vuer_quest_url": f"{base}?ws={ws}",
+        "vuer_cert_url": cert,
+        "vuer_headset_url": f"https://vuer.ai/?ws={ws}",
+        "vuer_cert_url_usb": "https://localhost:8012",
+        "vuer_headset_url_usb": "https://localhost:8012?ws=wss://localhost:8012",
+        # Legacy aliases
+        "vuer_quest_url": f"https://vuer.ai/?ws={ws}",
         "vuer_quest_url_usb": "https://localhost:8012?ws=wss://localhost:8012",
     }
 
@@ -749,6 +754,11 @@ button{padding:.6rem 1rem;border:0;border-radius:8px;cursor:pointer;font-weight:
 select{background:#0a0c10;color:#e8eaed;border:1px solid #2a2f3d;border-radius:6px;padding:.3rem .5rem;margin-left:.5rem;font-size:.85rem}
 pre{background:#0a0c10;padding:.75rem;border-radius:8px;overflow:auto;max-height:220px;font-size:.75rem}
 a{color:#60a5fa}
+.vr-steps{margin:.5rem 0 0;padding:0;list-style:none}
+.vr-steps li{margin:.75rem 0;padding:.75rem;background:#0a0c10;border-radius:8px;border-left:3px solid #3b82f6}
+.vr-steps .step-n{font-weight:700;color:#93c5fd;margin-right:.35rem}
+.vr-url{display:block;margin-top:.35rem;padding:.5rem .6rem;background:#252a36;border-radius:6px;font-size:.8rem;word-break:break-all;font-family:ui-monospace,monospace}
+.vr-note{font-size:.85rem;color:#9ca3af;margin-top:.5rem}
 </style></head><body>
 <header><h1>FFW VR + Recorder Dashboard</h1></header>
 <main>
@@ -775,6 +785,12 @@ a{color:#60a5fa}
 <button class="secondary" onclick="act('launch_recorder')">Isaac Only</button>
 <button class="danger" onclick="act('kill_isaac')">Kill Isaac</button>
 <button class="secondary" onclick="refresh()">Refresh</button>
+</div>
+<div class="card" id="headset_card"><h3>Meta Quest — headset connection</h3>
+<p class="tag">After <b>Launch VR + Controller</b>, open these in <b>Meta Quest Browser</b> (WiFi, same LAN as this PC).</p>
+<ol class="vr-steps" id="headset_wifi"></ol>
+<p class="vr-note"><b>USB / ADB</b> (offline, no vuer.ai): run <code>adb_vr_connect/connect.sh</code>, then use the USB steps below.</p>
+<ol class="vr-steps" id="headset_usb"></ol>
 </div>
 <div class="card"><h3>Mimic pipeline</h3>
 <p class="tag">Run steps <b>one at a time</b> in order (wait for each to finish). Logs: <code>/tmp/sg2_ltable_pipe_&lt;step&gt;.log</code> in cyclo_lab container.</p>
@@ -869,11 +885,19 @@ async function refresh(){
   gripTxt+=' (auto-L in '+g.auto_l_in_s+'s)';
  }
  h+='Grip: <span class="tag '+gripCls+'">'+gripTxt+'</span><br>';
- h+='Save mode: <span class="tag">'+(d.auto_success?'auto success':'manual (N)')+'</span><br>';
- h+='Quest (WiFi): <code style="word-break:break-all">'+d.vuer_quest_url+'</code><br>';
- h+='Quest (USB/ADB): <code style="word-break:break-all">'+d.vuer_quest_url_usb+'</code><br>';
- h+='Vuer page: <a href="'+d.vuer_url+'" target="_blank">'+d.vuer_url+'</a> · WS: '+d.vuer_ws+'</p>';
+ h+='Save mode: <span class="tag">'+(d.auto_success?'auto success':'manual (N)')+'</span></p>';
  document.getElementById('meta').innerHTML=h;
+ document.getElementById('headset_wifi').innerHTML=
+  '<li><span class="step-n">Step 1</span>Accept certificate — open this URL, tap <b>Advanced → Proceed</b>:'
+  +'<span class="vr-url">'+d.vuer_cert_url+'</span></li>'
+  +'<li><span class="step-n">Step 2</span>New browser tab — open Vuer client (connects to your PC):'
+  +'<span class="vr-url">'+d.vuer_headset_url+'</span></li>'
+  +'<li><span class="step-n">Step 3</span>Tap <b>Enter VR</b> and allow hand tracking. SG2: squeeze both grips.</li>';
+ document.getElementById('headset_usb').innerHTML=
+  '<li><span class="step-n">Step 1</span>Accept certificate at:'
+  +'<span class="vr-url">'+d.vuer_cert_url_usb+'</span></li>'
+  +'<li><span class="step-n">Step 2</span>New tab (self-hosted, no internet needed):'
+  +'<span class="vr-url">'+d.vuer_headset_url_usb+'</span></li>';
  let s='';
  for(const[k,v]of Object.entries(d.containers))s+='<div class="tag">'+k+': <span class="'+(v?'ok':'bad')+'">'+(v?'up':'down')+'</span></div>';
  for(const[k,v]of Object.entries(d.status))s+='<div class="tag">'+k+': '+v+'</div>';
@@ -986,8 +1010,9 @@ class Handler(BaseHTTPRequestHandler):
 def main() -> None:
     urls = _vuer_urls()
     print(f"Dashboard http://0.0.0.0:{PORT}")
-    print(f"Quest Vuer (WiFi):  {urls['vuer_quest_url']}")
-    print(f"Quest Vuer (USB):   {urls['vuer_quest_url_usb']}")
+    print(f"Quest step 1 (accept cert): {urls['vuer_cert_url']}")
+    print(f"Quest step 2 (Enter VR):    {urls['vuer_headset_url']}")
+    print(f"Quest USB step 2:           {urls['vuer_headset_url_usb']}")
     HTTPServer(("0.0.0.0", PORT), Handler).serve_forever()
 
 
