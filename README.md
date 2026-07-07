@@ -81,24 +81,30 @@ python3 sg2_ltable_dashboard.py
 
 Open `http://localhost:8765`, select your task, launch the stack, connect VR (see [VR Teleoperation](#vr-teleoperation--how-to-connect)), and record demos.
 
-Recorder controls in Isaac window:
-- `B` start recording
-- `N` save episode
-- `R` reset / skip episode
-- `L` trigger L-motion
+**Recording workflow (each take):**
 
-Raw dataset is written to `~/AIWORKER/cyclo_lab/datasets/*_raw.hdf5`.
+| Step | Control | Action |
+|------|---------|--------|
+| 1 | **B** (Isaac window) | Start recording + activate arm teleop for this take |
+| 2 | Both VR grips ~3s | Enable VR teleop (SG2) |
+| 3 | Pick box | Base auto-turns/drives to L-table once gripped (or **L** manually) |
+| 4 | **N** | Save episode if happy with the take |
+| 4 alt | **R** | Discard take and restart (not saved) |
+
+Press **B** before every new take. Raw dataset: `~/AIWORKER/cyclo_lab/datasets/*_raw.hdf5`.
 
 ### 2) Run Mimic pipeline (dashboard)
 
-From the dashboard **Mimic pipeline** section, run steps in order:
-1. IK convert (`raw -> ik`)
-2. Annotate (`ik -> annotate`)
-3. Generate (`annotate -> generate`)
-4. Joint convert (`generate -> joint`)
-5. (Optional) LeRobot export (`joint -> lerobot`)
+After recording, run these **one at a time** in the dashboard **Mimic pipeline** section (wait for each to finish):
 
-Wait for each step to complete before starting the next.
+| Step | Input → output | What it does |
+|------|----------------|--------------|
+| **1. IK convert** | `raw → ik` | Convert joint recordings to IK (end-effector) actions |
+| **2. Annotate** | `ik → annotate` | Label subtask segments (grasp, move, place) for Mimic |
+| **3. Datagen** | `annotate → generate` | Synthesize many demos by replaying segments + L-motion |
+| **4. Joint convert** | `generate → joint` | Convert to joint-action HDF5 for robomimic training |
+| **5. LeRobot export** | `joint → lerobot` | Optional — for ACT/LeRobot only (skip for robomimic) |
+
 
 ### 3) Train robomimic
 
@@ -313,7 +319,7 @@ Re-run `./connect.sh` after every USB reconnect (`adb reverse` resets on unplug)
 
 ### Enable robot control after connecting
 
-**SG2 (gripper):** Squeeze **both** controller grips to enable VR publishing.
+**SG2 (gripper):** **Hold both controller grips for ~3 seconds** to enable VR teleop (release disables it).
 
 **SH5 (hands):** VR publishing starts **disabled**. Enable with the SH5 hand gesture, or:
 
@@ -331,12 +337,20 @@ ros2 topic pub --once /vr/reactivate std_msgs/msg/Bool "{data: true}"
 
 ### Recording demos (Isaac window focus)
 
+**Each take — repeat this cycle:**
+
+1. Press **B** — start recording and activate arm teleop for this episode (required before every take).
+2. In VR (SG2): **hold both controller grips for ~3 seconds** to enable teleop.
+3. Pick the box — once gripped, the base **auto-turns and drives** toward the L-table (or press **L** manually).
+4. **N** — save the episode if you are happy with the take.
+5. **R** — discard the take and restart (episode is not saved).
+
 | Key | Action |
 |-----|--------|
-| **B** | Start / stop recording |
-| **N** | Save episode (manual mode) |
-| **R** | Reset / skip episode |
-| **L** | Trigger L-motion (rotate + drive to table) |
+| **B** | Start recording + teleop (press before each take) |
+| **N** | Save episode |
+| **R** | Discard and restart |
+| **L** | Manual L-motion (rotate + drive to table) |
 
 L-motion uses kinematic root teleport (swerve off) so carried boxes stay stable. After gripping ~2 s, L-motion can auto-start when `teleop_auto_l_on_grip_s` is set on the task.
 

@@ -792,8 +792,26 @@ a{color:#60a5fa}
 <p class="vr-note"><b>USB / ADB</b> (offline, no vuer.ai): run <code>adb_vr_connect/connect.sh</code>, then use the USB steps below.</p>
 <ol class="vr-steps" id="headset_usb"></ol>
 </div>
+<div class="card"><h3>Recording — VR + Isaac controls</h3>
+<p class="tag">Focus the <b>Isaac Sim window</b> for keyboard keys. Use VR controllers for arm motion.</p>
+<ol class="vr-steps">
+<li><span class="step-n">Before each take</span>Press <b>B</b> in Isaac to start recording and activate arm teleop for this episode.</li>
+<li><span class="step-n">VR teleop (SG2)</span>In the headset, <b>hold both controller grips for ~3 seconds</b> to enable robot control.</li>
+<li><span class="step-n">Pick the box</span>Once the box is gripped, the base <b>turns and drives automatically</b> toward the L-table (or press <b>L</b> manually).</li>
+<li><span class="step-n">Happy with the take?</span>Press <b>N</b> in Isaac to <b>save</b> the episode.</li>
+<li><span class="step-n">Bad take?</span>Press <b>R</b> in Isaac to <b>discard</b> and restart (does not save).</li>
+</ol>
+<p class="vr-note">Repeat: <b>B</b> before every new take. SH5 hand tasks: use hand gesture to enable VR publishing; lift with <b>I</b>/<b>O</b> in Isaac.</p>
+</div>
 <div class="card"><h3>Mimic pipeline</h3>
-<p class="tag">Run steps <b>one at a time</b> in order (wait for each to finish). Logs: <code>/tmp/sg2_ltable_pipe_&lt;step&gt;.log</code> in cyclo_lab container.</p>
+<p class="tag">After recording <code>*_raw.hdf5</code>, run steps <b>one at a time</b> in order. Logs: <code>/tmp/sg2_ltable_pipe_&lt;step&gt;.log</code></p>
+<ol class="vr-steps" style="margin-bottom:1rem">
+<li><span class="step-n">1. IK convert</span><code>raw → ik</code> — convert recorded joint demos to IK (end-effector) actions.</li>
+<li><span class="step-n">2. Annotate</span><code>ik → annotate</code> — label subtask segments (grasp, move, place) for Mimic.</li>
+<li><span class="step-n">3. Datagen</span><code>annotate → generate</code> — synthesize many demos by replaying segments + L-motion.</li>
+<li><span class="step-n">4. Joint convert</span><code>generate → joint</code> — convert to joint-action format for robomimic training.</li>
+<li><span class="step-n">5. LeRobot export</span><code>joint → lerobot</code> — optional; for ACT / LeRobot (not needed for robomimic).</li>
+</ol>
 <div class="row" id="pipeline_buttons"></div>
 <div class="row">
 <button class="primary" onclick="pipe('full')">Run all steps sequentially</button>
@@ -803,10 +821,6 @@ a{color:#60a5fa}
 </div>
 <div class="card"><div id="meta"></div><div class="grid" id="status"></div></div>
 <div class="card"><h3>Logs</h3><pre id="logs"></pre></div>
-<p><b>Launch Record</b> restarts VR + motion controller for the selected robot, then starts Isaac.
-Gripper tasks use <code>model:=sg2 hand:=false</code>; hand tasks use <code>model:=sh5 hand:=true</code>.
-VR: accept cert at Vuer URL. SG2: squeeze both grips. SH5: hand gesture to toggle publishing; <code>I</code>/<code>O</code> lift up/down in Isaac. Recording: <code>B</code> start, <code>N</code> save (manual default), <code>R</code> reset, <code>L</code> L-motion.
-B=record, L=face target table (or auto after 2s gripped), N=save, R=reset.</p>
 </main>
 <script>
 async function act(a){await fetch('/api/'+a,{method:'POST'});refresh()}
@@ -892,7 +906,7 @@ async function refresh(){
   +'<span class="vr-url">'+d.vuer_cert_url+'</span></li>'
   +'<li><span class="step-n">Step 2</span>New browser tab — open Vuer client (connects to your PC):'
   +'<span class="vr-url">'+d.vuer_headset_url+'</span></li>'
-  +'<li><span class="step-n">Step 3</span>Tap <b>Enter VR</b> and allow hand tracking. SG2: squeeze both grips.</li>';
+  +'<li><span class="step-n">Step 3</span>Tap <b>Enter VR</b>. SG2: <b>hold both grips ~3s</b> to enable teleop.</li>';
  document.getElementById('headset_usb').innerHTML=
   '<li><span class="step-n">Step 1</span>Accept certificate at:'
   +'<span class="vr-url">'+d.vuer_cert_url_usb+'</span></li>'
