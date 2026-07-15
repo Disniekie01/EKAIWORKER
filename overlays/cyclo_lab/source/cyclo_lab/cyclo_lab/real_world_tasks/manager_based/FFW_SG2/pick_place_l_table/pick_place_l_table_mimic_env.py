@@ -97,6 +97,7 @@ class FFWSG2PickPlaceLTableMimicEnv(FFWSG2PickPlaceMimicEnv):
         self._mimic_carry_latch = False
         self._kinematic_step_last_time = None
         self._last_step_was_kinematic = False
+        self._mimic_last_eef_quat = {}
         self._l_motion_ctrl.reset()
         ret = super().reset(*args, **kwargs)
         self.sim.forward()

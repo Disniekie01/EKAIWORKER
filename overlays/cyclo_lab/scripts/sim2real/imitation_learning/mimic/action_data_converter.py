@@ -110,8 +110,8 @@ def convert_joint_to_ik_ffw_sg2(ep_data: EpisodeData) -> EpisodeData:
     """Convert joint actions to IK (EEF state + gripper + lift + head) for FFW SG2 robot."""
     try:
         # FFW SG2 has dual arms, need to handle both left and right EEF states
-        left_eef_pose = ep_data.data["obs"]["left_eef_pose"]
-        right_eef_pose = ep_data.data["obs"]["right_eef_pose"]
+        left_eef_pose = _ensure_eef_quat_continuity(ep_data.data["obs"]["left_eef_pose"])
+        right_eef_pose = _ensure_eef_quat_continuity(ep_data.data["obs"]["right_eef_pose"])
         joint_actions = ep_data.data["actions"]
 
         grip_l_i, grip_r_i, head_sl, lift_sl = _ffw_sg2_joint_action_indices(
@@ -122,21 +122,35 @@ def convert_joint_to_ik_ffw_sg2(ep_data: EpisodeData) -> EpisodeData:
         head_action = joint_actions[:, head_sl]
         lift_action = joint_actions[:, lift_sl]
 
-        # IK action order (total 19):
-        # [left_eef(7), gripper_l(1), right_eef(7), gripper_r(1), head(2), lift(1)]
+        # IK action order (total 19) — ActionManager trailing order:
+        # [left_eef(7), gripper_l(1), right_eef(7), gripper_r(1), lift(1), head(2)]
         new_actions = torch.cat([
             left_eef_pose,    # 0-6: left EEF (pos + quat)
             gripper_l_action,  # 7: left gripper
             right_eef_pose,   # 8-14: right EEF (pos + quat)
             gripper_r_action,  # 15: right gripper
-            head_action,        # 16-17: head joints
-            lift_action       # 18: lift joint
+            lift_action,      # 16: lift joint
+            head_action,      # 17-18: head joints
         ], dim=1)
 
         ep_data.data["actions"] = new_actions
         return ep_data
     except (KeyError, IndexError, TypeError) as e:
         raise ValueError(f"Failed to convert joint to IK for FFW_SG2: {str(e)}")
+
+
+def _ensure_eef_quat_continuity(eef_pose: torch.Tensor) -> torch.Tensor:
+    """Flip quaternion double-cover along the time axis so consecutive quats agree."""
+    if not isinstance(eef_pose, torch.Tensor):
+        eef_pose = torch.as_tensor(eef_pose)
+    if eef_pose.ndim != 2 or eef_pose.shape[1] < 7 or eef_pose.shape[0] < 2:
+        return eef_pose
+    out = eef_pose.clone()
+    quat = out[:, 3:7]
+    for i in range(1, quat.shape[0]):
+        if torch.dot(quat[i], quat[i - 1]) < 0:
+            quat[i] *= -1
+    return out
 
 def convert_joint_to_ik(ep_data: EpisodeData, robot_type: str) -> EpisodeData:
     """Convert joint actions to IK based on robot type."""
@@ -149,11 +163,41 @@ def convert_joint_to_ik(ep_data: EpisodeData, robot_type: str) -> EpisodeData:
     else:
         raise ValueError(f"Unknown robot type: {robot_type}")
 
-def convert_ik_to_joint(ep_data: EpisodeData) -> EpisodeData:
-    """Convert IK actions to joint targets."""
+def _reorder_ffw_sg2_joint_actions_to_env_layout(joint_targets):
+    """Map observation joint layout → ActionManager layout for SG2.
+
+    Observation ``joint_pos_target`` order:
+        [..., head_joint1(16), lift_joint(17), head_joint2(18)]
+    ActionManager / env order:
+        [..., lift_joint(16), head_joint1(17), head_joint2(18)]
+    """
+    if joint_targets.shape[-1] != 19:
+        return joint_targets
+    if isinstance(joint_targets, torch.Tensor):
+        reordered = joint_targets.clone()
+    else:
+        reordered = joint_targets.copy()
+    reordered[..., 16] = joint_targets[..., 17]
+    reordered[..., 17] = joint_targets[..., 16]
+    return reordered
+
+
+def convert_ik_to_joint(ep_data: EpisodeData, robot_type: str = "OMY") -> EpisodeData:
+    """Convert IK actions to joint targets.
+
+    For FFW_SG2, remaps observation ``joint_pos_target`` layout
+    ``[head1, lift, head2]`` into ActionManager order ``[lift, head1, head2]``
+    so training / play actions match ``env.step`` without a second remap.
+    """
     try:
         joint_targets = ep_data.data["obs"]["joint_pos_target"]
-        ep_data.data["actions"] = joint_targets
+        if robot_type == "FFW_SG2":
+            joint_targets = _reorder_ffw_sg2_joint_actions_to_env_layout(joint_targets)
+        # Detach from obs so later mutations of actions cannot mutate joint_pos_target.
+        if isinstance(joint_targets, torch.Tensor):
+            ep_data.data["actions"] = joint_targets.clone()
+        else:
+            ep_data.data["actions"] = joint_targets.copy()
         return ep_data
     except (KeyError, IndexError, TypeError) as e:
         raise ValueError(f"Failed to convert IK to joint: {str(e)}")
@@ -186,7 +230,7 @@ def process_dataset(input_file: str, output_file: str, action_type: str, robot_t
                 if action_type == "ik":
                     processed = convert_joint_to_ik(processed, robot_type)
                 elif action_type == "joint":
-                    processed = convert_ik_to_joint(processed)
+                    processed = convert_ik_to_joint(processed, robot_type)
                 
                 output_handler.write_episode(processed)
                 

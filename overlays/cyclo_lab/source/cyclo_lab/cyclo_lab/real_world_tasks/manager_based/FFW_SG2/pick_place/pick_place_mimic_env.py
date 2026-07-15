@@ -25,6 +25,7 @@ class FFWSG2PickPlaceMimicEnv(ManagerBasedRLMimicEnv):
         super().__init__(cfg, render_mode, **kwargs)
         self.robot_root_pos = self.scene['robot'].data.root_pos_w
         self.robot_root_quat = self.scene['robot'].data.root_quat_w
+        self._mimic_last_eef_quat: dict[str, torch.Tensor] = {}
 
     @classmethod
     def _lift_head_from_joint_obs(cls, joint_row: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -102,7 +103,7 @@ class FFWSG2PickPlaceMimicEnv(ManagerBasedRLMimicEnv):
 
             # Convert right EEF pose to pos + quat
             right_eef_pos, right_eef_rot = PoseUtils.unmake_pose(target_right_eef_pose)
-            right_eef_quat = PoseUtils.quat_from_matrix(right_eef_rot)
+            right_eef_quat = self._continuous_eef_quat(eef_name, PoseUtils.quat_from_matrix(right_eef_rot))
 
             right_pose_action = torch.cat([right_eef_pos, right_eef_quat], dim=0)
 
@@ -142,7 +143,7 @@ class FFWSG2PickPlaceMimicEnv(ManagerBasedRLMimicEnv):
 
             # Convert left EEF pose to pos + quat
             left_eef_pos, left_eef_rot = PoseUtils.unmake_pose(target_left_eef_pose)
-            left_eef_quat = PoseUtils.quat_from_matrix(left_eef_rot)
+            left_eef_quat = self._continuous_eef_quat(eef_name, PoseUtils.quat_from_matrix(left_eef_rot))
 
             left_pose_action = torch.cat([left_eef_pos, left_eef_quat], dim=0)
 
@@ -194,9 +195,11 @@ class FFWSG2PickPlaceMimicEnv(ManagerBasedRLMimicEnv):
         def _eef_action(eef_name: str, fallback_obs_key: str) -> torch.Tensor:
             if eef_name in target_eef_pose_dict:
                 pos, rot = PoseUtils.unmake_pose(target_eef_pose_dict[eef_name])
-                return torch.cat([pos, PoseUtils.quat_from_matrix(rot)], dim=0)
+                quat = PoseUtils.quat_from_matrix(rot)
+                return torch.cat([pos, self._continuous_eef_quat(eef_name, quat)], dim=0)
             obs_pose = self.obs_buf["policy"][fallback_obs_key]
-            return obs_pose[env_id, :7] if obs_pose.dim() > 1 else obs_pose[:7]
+            pose = obs_pose[env_id, :7] if obs_pose.dim() > 1 else obs_pose[:7]
+            return torch.cat([pose[:3], self._continuous_eef_quat(eef_name, pose[3:7])], dim=0)
 
         left_pose = _eef_action("left_arm", "left_eef_pose")
         right_pose = _eef_action("right_arm", "right_eef_pose")
@@ -209,6 +212,17 @@ class FFWSG2PickPlaceMimicEnv(ManagerBasedRLMimicEnv):
             dim=0,
         )
         return action.unsqueeze(0)
+
+    def _continuous_eef_quat(self, eef_name: str, quat: torch.Tensor) -> torch.Tensor:
+        """Avoid quaternion double-cover flips across Mimic waypoints (source of arm jerks)."""
+        if not hasattr(self, "_mimic_last_eef_quat"):
+            self._mimic_last_eef_quat = {}
+        q = quat.reshape(-1).to(dtype=torch.float32)
+        prev = self._mimic_last_eef_quat.get(eef_name)
+        if prev is not None and torch.dot(q, prev) < 0:
+            q = -q
+        self._mimic_last_eef_quat[eef_name] = q.detach().clone()
+        return q
 
     def action_to_target_eef_pose(self, action: torch.Tensor) -> dict[str, torch.Tensor]:
         if len(self.cfg.subtask_configs) > 1:

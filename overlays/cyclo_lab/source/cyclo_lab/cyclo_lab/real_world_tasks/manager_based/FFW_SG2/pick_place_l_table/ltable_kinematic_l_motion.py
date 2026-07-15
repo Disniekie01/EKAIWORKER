@@ -54,6 +54,8 @@ class LTableKinematicLMotion:
         self._forward_distance_m = float(getattr(cfg, "teleop_l_forward_m", 0.30))
         self._rotation_duration_s = float(getattr(cfg, "teleop_l_rotation_duration_s", 3.0))
         self._forward_duration_s = float(getattr(cfg, "teleop_l_forward_duration_s", 2.0))
+        self._grasp_diff_threshold = float(getattr(cfg, "grasp_diff_threshold", 0.18))
+        self._gripper_close_threshold = float(getattr(cfg, "gripper_close_threshold", 0.2))
         self._sim_dt = float(self.env.physics_dt * self.env.cfg.decimation)
 
     def is_active(self) -> bool:
@@ -82,9 +84,11 @@ class LTableKinematicLMotion:
         return self._grasp_latch_candidates(env_ids)
 
     def _grasp_latch_candidates(
-        self, env_ids: torch.Tensor, *, diff_threshold: float = 0.18
+        self, env_ids: torch.Tensor, *, diff_threshold: float | None = None
     ) -> torch.Tensor:
         """Both grippers closed and box near each eef (strict bimanual grasp)."""
+        if diff_threshold is None:
+            diff_threshold = float(getattr(self, "_grasp_diff_threshold", 0.18))
         closed = self._grippers_closed_mask(env_ids)
         if not closed.any():
             return torch.zeros(len(env_ids), dtype=torch.bool, device=self.env.device)
@@ -109,7 +113,9 @@ class LTableKinematicLMotion:
         env_ids = torch.arange(self.env.num_envs, device=self.env.device)
         return bool(self._dual_grasped_mask(env_ids).any())
 
-    def _grippers_closed_mask(self, env_ids: torch.Tensor, *, threshold: float = 0.2) -> torch.Tensor:
+    def _grippers_closed_mask(self, env_ids: torch.Tensor, *, threshold: float | None = None) -> torch.Tensor:
+        if threshold is None:
+            threshold = float(getattr(self, "_gripper_close_threshold", 0.2))
         robot = self.env.scene["robot"]
         left_i = robot.joint_names.index("gripper_l_joint1")
         right_i = robot.joint_names.index("gripper_r_joint1")

@@ -49,6 +49,10 @@ _LEFT_FINGER_HOLD_MIN = 0.12
 _LEFT_FINGER_HOLD_ALPHA = 0.38
 _LEFT_FINGER_HOLD_ALPHA_FIRM = 0.62
 
+# Shared with robotis_vuer publishers (ROS/DDS) so R clears VR/controller state.
+EPISODE_RESET_TOPIC = "/eykorea/episode_reset"
+EPISODE_RESET_PAYLOAD = "reset"
+
 
 class FFWSG2Sdk:
     """FFWSG2Sdk class for DDS teleoperation and publishing humanoid robot state/images."""
@@ -68,6 +72,9 @@ class FFWSG2Sdk:
         self._left_gripper_smooth: float | None = None
         self.head_joint_trajectory_cmd = None
         self.lift_joint_trajectory_cmd = None
+        # When False (after R), DDS teleop cmds are discarded so the last demo
+        # pose cannot overwrite the env/home reset. Re-armed on B/start.
+        self._accept_teleop_cmds = True
         self._started = False
         self._reset_state = False
         self._additional_callbacks = {}
@@ -117,7 +124,13 @@ class FFWSG2Sdk:
         self._teleop_grip_status_path = os.environ.get(
             "EYKOREA_TELEOP_GRIP_STATUS", "/tmp/eykorea_teleop_grip.json"
         )
-        self.lock = threading.Lock()  # Protect shared state
+        # Soft left-gripper blend (overridden from env.cfg when present).
+        self._left_grip_smooth_alpha = _LEFT_GRIP_SMOOTH_ALPHA
+        self._left_finger_hold_min = _LEFT_FINGER_HOLD_MIN
+        self._left_finger_hold_alpha = _LEFT_FINGER_HOLD_ALPHA
+        self._left_finger_hold_alpha_firm = _LEFT_FINGER_HOLD_ALPHA_FIRM
+        self._left_finger_firm_grip = 0.45
+        self.lock = threading.RLock()  # Protect shared state; RLock allows nested reset
 
         # Initialize current joint state - will be updated only when commands are received
         self.current_joint_state = {}
@@ -169,6 +182,10 @@ class FFWSG2Sdk:
             topic_name="/camera_left/camera_left/color/image_rect_raw/compressed",
             topic_type=CompressedImage_
         )
+        self.episode_reset_writer = topic_manager.topic_writer(
+            topic_name=EPISODE_RESET_TOPIC,
+            topic_type=String_,
+        )
 
         # Start subscriber threads for both arms
         self.left_thread = threading.Thread(target=self._left_arm_subscriber_loop, daemon=True)
@@ -194,7 +211,7 @@ class FFWSG2Sdk:
         self._keyboard_controls()
 
     def _apply_env_teleop_config(self) -> None:
-        """Read optional per-task L-motion settings from ``env.cfg``."""
+        """Read optional per-task L-motion / soft-grip settings from ``env.cfg``."""
         cfg = getattr(self.env, "cfg", None)
         if cfg is None:
             return
@@ -210,6 +227,28 @@ class FFWSG2Sdk:
         self._use_swerve_l_motion = bool(getattr(cfg, "teleop_l_use_swerve", self._use_swerve_l_motion))
         self._auto_l_on_grip_s = float(
             getattr(cfg, "teleop_auto_l_on_grip_s", self._auto_l_on_grip_s)
+        )
+        self._swerve_yaw_tol = float(getattr(cfg, "teleop_l_swerve_yaw_tol", self._swerve_yaw_tol))
+        self._swerve_max_angular_z = float(
+            getattr(cfg, "teleop_l_swerve_max_angular_z", self._swerve_max_angular_z)
+        )
+        self._swerve_max_linear_x = float(
+            getattr(cfg, "teleop_l_swerve_max_linear_x", self._swerve_max_linear_x)
+        )
+        self._left_grip_smooth_alpha = float(
+            getattr(cfg, "teleop_left_grip_smooth_alpha", self._left_grip_smooth_alpha)
+        )
+        self._left_finger_hold_min = float(
+            getattr(cfg, "teleop_left_finger_hold_min", self._left_finger_hold_min)
+        )
+        self._left_finger_hold_alpha = float(
+            getattr(cfg, "teleop_left_finger_hold_alpha", self._left_finger_hold_alpha)
+        )
+        self._left_finger_hold_alpha_firm = float(
+            getattr(cfg, "teleop_left_finger_hold_alpha_firm", self._left_finger_hold_alpha_firm)
+        )
+        self._left_finger_firm_grip = float(
+            getattr(cfg, "teleop_left_finger_firm_grip", self._left_finger_firm_grip)
         )
 
     def _resolve_action_joint_order(self) -> list[str]:
@@ -239,7 +278,7 @@ class FFWSG2Sdk:
         if self._left_gripper_smooth is None:
             self._left_gripper_smooth = target
         else:
-            self._left_gripper_smooth += _LEFT_GRIP_SMOOTH_ALPHA * (
+            self._left_gripper_smooth += self._left_grip_smooth_alpha * (
                 target - self._left_gripper_smooth
             )
         return self._left_gripper_smooth
@@ -279,6 +318,7 @@ class FFWSG2Sdk:
                 if key.char == 'b':
                     self._started = True
                     self._reset_state = False
+                    self._accept_teleop_cmds = True
                     # Update episode tracking when manually starting
                     if self._first_episode:
                         self._first_episode = False
@@ -305,6 +345,7 @@ class FFWSG2Sdk:
                 if key.char == 'b':
                     self._started = True
                     self._reset_state = False
+                    self._accept_teleop_cmds = True
                 elif key.char == 'r':
                     self._started = False
                     self._reset_state = True
@@ -317,17 +358,45 @@ class FFWSG2Sdk:
         if key in self._additional_callbacks:
             self._additional_callbacks[key]()
 
-    def _request_pose_reset(self):
-        """Flag a robot root-pose reset and cancel any in-progress L motion.
+    def _clear_teleop_command_state(self) -> None:
+        """Drop cached arm/gripper/head/lift cmds from the previous demo.
 
-        Sets booleans only (no sim access); the actual write to sim happens on
-        the sim thread in ``publish_observations``. Safe to call whether or not
+        Must hold ``self.lock`` when calling (or otherwise ensure no concurrent
+        subscriber writes). Unlisted DOFs then fall back to the sim joint state
+        after ``env.reset()`` applied the task EventCfg home pose.
+        """
+        self.left_arm_trajectory_cmd = None
+        self.right_arm_trajectory_cmd = None
+        self._left_gripper_cmd = None
+        self._right_gripper_cmd = None
+        self._left_gripper_smooth = None
+        self.head_joint_trajectory_cmd = None
+        self.lift_joint_trajectory_cmd = None
+
+    def _signal_vr_episode_reset(self) -> None:
+        """Ask VR publishers to pause publishing and clear controller state."""
+        try:
+            self.episode_reset_writer.write(String_(data=EPISODE_RESET_PAYLOAD))
+        except Exception as exc:
+            print(f"[Control] Failed to signal VR episode reset: {exc}")
+
+    def _request_pose_reset(self):
+        """Flag a full robot/home reset and purge leftover teleop + VR state.
+
+        Sets booleans only for sim writes (no sim access here); the root-pose
+        write happens on the sim thread in ``publish_observations``. Joint home
+        comes from ``env.reset()`` EventCfg. Safe to call whether or not
         ``self.lock`` is already held.
         """
-        self._pending_reset_pose = True
-        self._rotation_active = False
-        self._forward_active = False
-        self._carry_box = False
+        with self.lock:
+            self._accept_teleop_cmds = False
+            self._clear_teleop_command_state()
+            self._pending_reset_pose = True
+            self._rotation_active = False
+            self._forward_active = False
+            self._carry_box = False
+            self._swerve_phase = None
+        self._signal_vr_episode_reset()
 
     def _advance_l_motion(self) -> None:
         """Step rotate/forward L-motion once (kinematic root + box carry)."""
@@ -361,6 +430,8 @@ class FFWSG2Sdk:
                     if msg and msg.points:
                         joint_dict = dict(zip(msg.joint_names, msg.points[-1].positions))
                         with self.lock:
+                            if not self._accept_teleop_cmds:
+                                continue
                             # Merge instead of replace: arm IK and gripper commands
                             # share this topic but arrive as separate partial
                             # messages, so replacing would erase the gripper.
@@ -385,6 +456,8 @@ class FFWSG2Sdk:
                     if msg and msg.points:
                         joint_dict = dict(zip(msg.joint_names, msg.points[-1].positions))
                         with self.lock:
+                            if not self._accept_teleop_cmds:
+                                continue
                             # Merge instead of replace: arm IK and gripper commands
                             # share this topic but arrive as separate partial
                             # messages, so replacing would erase the gripper.
@@ -409,6 +482,8 @@ class FFWSG2Sdk:
                     if msg and msg.points:
                         joint_dict = dict(zip(msg.joint_names, msg.points[-1].positions))
                         with self.lock:
+                            if not self._accept_teleop_cmds:
+                                continue
                             # Update only the lift joint command
                             self.lift_joint_trajectory_cmd = self.lift_joint_trajectory_cmd or {}
                             self.lift_joint_trajectory_cmd.update(joint_dict)
@@ -430,6 +505,8 @@ class FFWSG2Sdk:
                     if msg and msg.points:
                         joint_dict = dict(zip(msg.joint_names, msg.points[-1].positions))
                         with self.lock:
+                            if not self._accept_teleop_cmds:
+                                continue
                             # Update only the head joint commands
                             self.head_joint_trajectory_cmd = self.head_joint_trajectory_cmd or {}
                             self.head_joint_trajectory_cmd.update(joint_dict)
@@ -459,6 +536,7 @@ class FFWSG2Sdk:
                                 # First episode: only start recording
                                 self._started = True
                                 self._reset_state = False
+                                self._accept_teleop_cmds = True
                                 self._first_episode = False
                                 self._episode_phase = "recording"  # Now recording
                                 self._auto_l_fired_this_episode = False
@@ -473,6 +551,7 @@ class FFWSG2Sdk:
                                 # Currently idle: start new episode
                                 self._started = True
                                 self._reset_state = False
+                                self._accept_teleop_cmds = True
                                 self._episode_phase = "recording"  # Now recording
                                 self._auto_l_fired_this_episode = False
                     elif joystick_trigger == 'left':
@@ -541,6 +620,8 @@ class FFWSG2Sdk:
     def _publish_camera(self, cam_name: str):
         """Publish camera image as DDS compressed image."""
         try:
+            if cam_name not in self.env.scene.keys():
+                return
             cam_data = self.env.scene[cam_name].data
             img = cam_data.output['rgb'][0].cpu().numpy()  # Convert tensor to numpy (RGB format)
             
@@ -652,7 +733,7 @@ class FFWSG2Sdk:
     def _blend_left_gripper_fingers(self) -> None:
         """Blend mimic finger joints toward the smoothed close angle (not joint1)."""
         grip = self._left_gripper_hold_value()
-        if grip is None or grip < _LEFT_FINGER_HOLD_MIN:
+        if grip is None or grip < self._left_finger_hold_min:
             return
 
         robot = self.env.scene["robot"]
@@ -661,8 +742,9 @@ class FFWSG2Sdk:
         except ValueError:
             return
 
+        firm = float(self._left_finger_firm_grip)
         hold_alpha = (
-            _LEFT_FINGER_HOLD_ALPHA_FIRM if grip >= 0.45 else _LEFT_FINGER_HOLD_ALPHA
+            self._left_finger_hold_alpha_firm if grip >= firm else self._left_finger_hold_alpha
         )
         device = self.env.device
         env_ids = torch.tensor([0], device=device)
@@ -707,8 +789,8 @@ class FFWSG2Sdk:
             self._advance_l_motion()
         self._publish_joint_states()
         self._publish_camera("cam_head")
-        # self._publish_camera("cam_wrist_right")
-        # self._publish_camera("cam_wrist_left")
+        self._publish_camera("cam_wrist_right")
+        self._publish_camera("cam_wrist_left")
 
     # ----------------------
     # Utility
@@ -732,14 +814,18 @@ class FFWSG2Sdk:
         print("FFWSG2Sdk shutdown complete")
 
     def reset(self):
-        self._reset_state = False
-        self._rotation_active = False
-        self._forward_active = False
-        self._pending_reset_pose = False
-        self._pending_face_left = False
-        self._carry_box = False
-        self._swerve_phase = None
+        with self.lock:
+            self._reset_state = False
+            self._accept_teleop_cmds = False
+            self._clear_teleop_command_state()
+            self._rotation_active = False
+            self._forward_active = False
+            self._pending_reset_pose = False
+            self._pending_face_left = False
+            self._carry_box = False
+            self._swerve_phase = None
         self._reset_grip_tracking()
+        self._signal_vr_episode_reset()
 
     def on_episode_saved(self) -> None:
         """Match VR/joystick state after auto-save (same as manual N / right trigger)."""
@@ -747,13 +833,16 @@ class FFWSG2Sdk:
             self._started = False
             self._reset_state = True
             self._episode_phase = "idle"
-        self._rotation_active = False
-        self._forward_active = False
-        self._pending_reset_pose = False
-        self._pending_face_left = False
-        self._carry_box = False
-        self._swerve_phase = None
+            self._accept_teleop_cmds = False
+            self._clear_teleop_command_state()
+            self._rotation_active = False
+            self._forward_active = False
+            self._pending_reset_pose = False
+            self._pending_face_left = False
+            self._carry_box = False
+            self._swerve_phase = None
         self._reset_grip_tracking()
+        self._signal_vr_episode_reset()
 
     def _reset_grip_tracking(self) -> None:
         self._grip_start_time = None
@@ -859,8 +948,11 @@ class FFWSG2Sdk:
         self._last_grip_status = self._grip_status
 
     def _restore_home_pose(self):
-        """Restore the robot root pose (position + orientation) to its home/start
-        pose, undoing any rotation/translation applied by the L (face-left) action."""
+        """Restore base root pose and zero base velocity after an episode reset.
+
+        Arm/gripper/lift/head joints are restored by ``env.reset()`` EventCfg
+        ``set_robot_joint_pose``; this only undoes L-motion base translation/yaw.
+        """
         self._swerve_phase = None
         if self._swerve_controller is not None:
             self._apply_swerve_cmd_vel(0.0, 0.0, 0.0)

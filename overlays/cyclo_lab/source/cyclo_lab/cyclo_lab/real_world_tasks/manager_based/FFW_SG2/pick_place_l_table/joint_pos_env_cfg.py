@@ -118,9 +118,10 @@ class FFWSG2PickPlaceLTableEnvCfg(PickPlaceLTableEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.events = EventCfg()
-
         self.scene.robot = FFW_SG2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
         self.scene.robot.spawn.semantic_tags = [("class", "robot")]
+        # Home pose + optional gripper PD from named cfg fields.
+        self.sync_configured_params()
 
         self.scene.table_front = TABLE_FRONT_CFG.replace(prim_path="{ENV_REGEX_NS}/TableFront")
         self.scene.table_left = TABLE_LEFT_CFG.replace(prim_path="{ENV_REGEX_NS}/TableLeft")
@@ -148,6 +149,41 @@ class FFWSG2PickPlaceLTableEnvCfg(PickPlaceLTableEnvCfg):
                 rot=(0.5, 0.5, -0.5, -0.5),
                 convention="isaac",
             ),
+        )
+        # Wrist D405s: SG2 gripper USD already has camera_*_bottom_screw_frame under
+        # arm_*_link7 (same mount numbers as SH5 hands URDF). Composing the full URDF
+        # optical chain again under arm_*_link7 double-applied the mount and looked wrong.
+        # Pose below was hand-tuned in the viewport for this gripper USD (local to arm_*_link7).
+        _wrist_cam_spawn = sim_utils.PinholeCameraCfg(
+            focal_length=5.0,
+            focus_distance=400.0,
+            horizontal_aperture=20.955,
+            clipping_range=(0.01, 2.0),
+        )
+        # Omniverse Property panel (under arm_*_link7): translate (0.2, 0, -0.1),
+        # orient XYZ deg (-8, 34, -83). Stored as OpenGL/USD local offset.
+        _wrist_cam_offset = CameraCfg.OffsetCfg(
+            pos=(0.2, 0.0, -0.1),
+            rot=(0.700971, -0.243221, 0.174238, -0.647398),
+            convention="opengl",
+        )
+        self.scene.cam_wrist_left = CameraCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/ffw_sg2_follower/arm_l_link7/cam_wrist_left",
+            update_period=0.0,
+            height=376,
+            width=672,
+            data_types=["rgb"],
+            spawn=_wrist_cam_spawn,
+            offset=_wrist_cam_offset,
+        )
+        self.scene.cam_wrist_right = CameraCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/ffw_sg2_follower/arm_r_link7/cam_wrist_right",
+            update_period=0.0,
+            height=376,
+            width=672,
+            data_types=["rgb"],
+            spawn=_wrist_cam_spawn,
+            offset=_wrist_cam_offset,
         )
 
         marker_cfg = FRAME_MARKER_CFG.copy()

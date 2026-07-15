@@ -34,13 +34,16 @@ from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from robotis_interfaces.msg import HandJoints
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import CompressedImage
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from vuer import Vuer
 from vuer.schemas import Body, Hands, HemisphereLightStage, ImageBackground, Scene
 
 # Allow nested asyncio execution
 nest_asyncio.apply()
+
+EPISODE_RESET_TOPIC = '/eykorea/episode_reset'
+EPISODE_RESET_PAYLOAD = 'reset'
 
 # WebXR Body Tracking joint order (XRBodyJoint enum)
 BODY_JOINT_KEYS = [
@@ -473,6 +476,12 @@ class VRTrajectoryPublisher(Node):
             self.reactivate_callback,
             10,
         )
+        self.episode_reset_sub = self.create_subscription(
+            String,
+            EPISODE_RESET_TOPIC,
+            self.episode_reset_callback,
+            10,
+        )
         self.odom_sub = self.create_subscription(
             Odometry, '/odom', self.odom_callback, self.vr_stream_qos
         )
@@ -686,6 +695,37 @@ class VRTrajectoryPublisher(Node):
             f'[OVERRIDE] VR publishing set to {state_text}.'
         )
 
+    def episode_reset_callback(self, msg):
+        """Clear VR/controller leftovers when Isaac requests an episode reset (R)."""
+        payload = (msg.data or '').strip().lower()
+        if payload and payload != EPISODE_RESET_PAYLOAD:
+            return
+        self._clear_episode_controller_state(reason='isaac episode reset')
+
+    def _clear_episode_controller_state(self, reason='episode reset'):
+        """Pause VR publishing and wipe pose filters / lift jog latch."""
+        self._set_vr_publishing_enabled(False, reset_references=False)
+        self.pose_filters = {}
+        self.start_poses_left = False
+        self.start_poses_right = False
+        if hasattr(self, 'prev_poses_left'):
+            self.prev_poses_left.fill(0.0)
+        if hasattr(self, 'prev_poses_right'):
+            self.prev_poses_right.fill(0.0)
+        self.initial_camera_height = None
+        self.initial_camera_position = None
+        self.initial_camera_yaw = None
+        self.previous_camera_position = None
+        self.previous_camera_yaw = None
+        self._lift_jog_dir = 0
+        self._lift_jog_command = 0.0
+        self._lift_jog_last_time = None
+        self._publish_reactivate_state(False)
+        self.get_logger().info(
+            f'[RESET] VR controller state cleared ({reason}). '
+            'Re-enable teleop with the usual gesture / A toggle.'
+        )
+
     def is_vr_publishing_active(self):
         """Return current VR publishing state."""
         return bool(self.vr_publishing_enabled)
@@ -707,6 +747,9 @@ class VRTrajectoryPublisher(Node):
             self.initial_camera_yaw = None
             self.previous_camera_position = None
             self.previous_camera_yaw = None
+            self.pose_filters = {}
+            self._lift_jog_dir = 0
+            self._lift_jog_last_time = None
             if self.current_odom is not None:
                 pos = self.current_odom.pose.pose.position
                 quat = self.current_odom.pose.pose.orientation
