@@ -46,10 +46,68 @@ parser.add_argument(
     help="Auto-save when the task success term is met. Default: manual save with N / right trigger.",
 )
 
+# Optional overrides for task cfg teleop / home / grasp knobs (no source edits).
+parser.add_argument("--teleop-l-yaw", type=float, default=None, help="Base L-motion yaw (rad).")
+parser.add_argument("--teleop-l-forward-m", type=float, default=None, help="L-motion forward distance (m).")
+parser.add_argument(
+    "--teleop-l-rotation-duration-s", type=float, default=None, help="L-motion rotate duration (s)."
+)
+parser.add_argument(
+    "--teleop-l-forward-duration-s", type=float, default=None, help="L-motion forward duration (s)."
+)
+parser.add_argument(
+    "--teleop-auto-l-on-grip-s",
+    type=float,
+    default=None,
+    help="Auto-start L-motion after sustained grasp (s). 0 disables.",
+)
+parser.add_argument("--home-lift-joint", type=float, default=None, help="Reset lift joint height (m).")
+parser.add_argument("--home-arm-joint1", type=float, default=None, help="Reset arm_*_joint1 (rad).")
+parser.add_argument("--home-arm-joint4", type=float, default=None, help="Reset arm_*_joint4 (rad).")
+parser.add_argument("--home-head-joint1", type=float, default=None, help="Reset head_joint1 (rad).")
+parser.add_argument(
+    "--grasp-diff-threshold", type=float, default=None, help="Bimanual grasp eef-object distance (m)."
+)
+parser.add_argument(
+    "--gripper-close-threshold", type=float, default=None, help="Gripper closed joint threshold."
+)
+parser.add_argument("--gripper-l-stiffness", type=float, default=None, help="Left gripper PD stiffness.")
+parser.add_argument("--gripper-l-damping", type=float, default=None, help="Left gripper PD damping.")
+
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
 args_cli = parser.parse_args()
+
+
+def _apply_cli_motion_overrides(env_cfg) -> None:
+    """Map record_demos CLI flags onto env.cfg fields, then sync dependent terms."""
+    mapping = {
+        "teleop_l_yaw": args_cli.teleop_l_yaw,
+        "teleop_l_forward_m": args_cli.teleop_l_forward_m,
+        "teleop_l_rotation_duration_s": args_cli.teleop_l_rotation_duration_s,
+        "teleop_l_forward_duration_s": args_cli.teleop_l_forward_duration_s,
+        "teleop_auto_l_on_grip_s": args_cli.teleop_auto_l_on_grip_s,
+        "home_lift_joint": args_cli.home_lift_joint,
+        "home_arm_joint1": args_cli.home_arm_joint1,
+        "home_arm_joint4": args_cli.home_arm_joint4,
+        "home_head_joint1": args_cli.home_head_joint1,
+        "grasp_diff_threshold": args_cli.grasp_diff_threshold,
+        "gripper_close_threshold": args_cli.gripper_close_threshold,
+        "gripper_l_stiffness": args_cli.gripper_l_stiffness,
+        "gripper_l_damping": args_cli.gripper_l_damping,
+    }
+    applied = []
+    for attr, value in mapping.items():
+        if value is None or not hasattr(env_cfg, attr):
+            continue
+        setattr(env_cfg, attr, value)
+        applied.append(f"{attr}={value}")
+    if applied and hasattr(env_cfg, "sync_configured_params"):
+        env_cfg.sync_configured_params()
+        print(f"[record_demos] Applied motion/cfg overrides: {', '.join(applied)}")
+    elif applied:
+        print(f"[record_demos] Applied motion/cfg overrides (no sync): {', '.join(applied)}")
 
 app_launcher_args = vars(args_cli)
 
@@ -143,6 +201,7 @@ def main():
     env_cfg.init_action_cfg("record")
     env_cfg.seed = args_cli.seed
     task_name = args_cli.task
+    _apply_cli_motion_overrides(env_cfg)
 
     # modify configuration
     if hasattr(env_cfg.terminations, "time_out"):

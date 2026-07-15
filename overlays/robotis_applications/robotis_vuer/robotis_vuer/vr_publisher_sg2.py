@@ -29,7 +29,7 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, Float32
+from std_msgs.msg import Bool, Float32, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from vuer import Vuer
 from vuer.schemas import Body, MotionControllers, Scene
@@ -38,6 +38,8 @@ from vuer.schemas import Body, MotionControllers, Scene
 nest_asyncio.apply()
 
 BODY_HEAD_INDEX = 6  # XRBodyJoint 'head'
+EPISODE_RESET_TOPIC = '/eykorea/episode_reset'
+EPISODE_RESET_PAYLOAD = 'reset'
 BODY_LEFT_SHOULDER_INDEX = 8  # XRBodyJoint 'left-scapula'
 BODY_LEFT_ELBOW_INDEX = 10  # XRBodyJoint 'left-arm-lower'
 BODY_RIGHT_SHOULDER_INDEX = 13  # XRBodyJoint 'right-scapula'
@@ -197,6 +199,12 @@ class VRTrajectoryPublisher(Node):
         self.both_b_buttons_pressed_prev = False
         self.both_squeezes_prev = False
         self.last_reactivate_state = None
+        self.episode_reset_sub = self.create_subscription(
+            String,
+            EPISODE_RESET_TOPIC,
+            self.episode_reset_callback,
+            10,
+        )
 
         self.joint_states_sub = self.create_subscription(
             JointState,
@@ -470,6 +478,51 @@ class VRTrajectoryPublisher(Node):
                 f'{state_text}{reason_text}'
             )
         self.last_reactivate_state = msg.data
+
+    def episode_reset_callback(self, msg):
+        """Clear VR/controller leftovers when Isaac requests an episode reset (R)."""
+        payload = (msg.data or '').strip().lower()
+        if payload and payload != EPISODE_RESET_PAYLOAD:
+            return
+        self._clear_episode_controller_state(reason='isaac episode reset')
+
+    def _clear_episode_controller_state(self, reason='episode reset'):
+        """Pause VR publishing and drop cached controller/lift references."""
+        self.vr_publishing_enabled = False
+        self.left_controller_matrix = None
+        self.right_controller_matrix = None
+        self.left_elbow_matrix = None
+        self.right_elbow_matrix = None
+        self.left_shoulder_matrix = None
+        self.right_shoulder_matrix = None
+        self.pending_body_pose_frame = False
+        self.pending_controller_pose_frame = False
+        self.left_squeeze_value = 0.0
+        self.right_squeeze_value = 0.0
+        self.both_a_buttons_pressed_prev = False
+        self.both_b_buttons_pressed_prev = False
+        self.both_squeezes_prev = False
+        self.lift_reference_position_for_pose = None
+        self.last_head_command = None
+        self.last_lift_command = None
+        self.last_cmd_vel_command = (0.0, 0.0, 0.0)
+        # Hard-stop base motion so leftover thumbstick command cannot move the base.
+        twist_msg = Twist()
+        self.cmd_vel_pub.publish(twist_msg)
+        self._publish_reactivate(False, reason=reason, force_log=True)
+        self.get_logger().info(
+            f'[RESET] VR controller state cleared ({reason}). '
+            'Re-squeeze both grips or press both A to resume teleop.'
+        )
+
+    def _enable_vr_publishing(self, reason=None):
+        """Resume VR publishing after an episode reset with fresh lift reference."""
+        if self.vr_publishing_enabled:
+            return
+        self.vr_publishing_enabled = True
+        self.lift_reference_position_for_pose = None
+        reason_text = f' ({reason})' if reason else ''
+        self.get_logger().info(f'[RESET] VR publishing re-enabled{reason_text}')
 
     def _both_squeezes_active(self):
         """Return True while both squeeze inputs stay above threshold."""
@@ -1338,6 +1391,7 @@ class VRTrajectoryPublisher(Node):
             )
             both_a_now = left_a and right_a
             if both_a_now and not self.both_a_buttons_pressed_prev:
+                self._enable_vr_publishing(reason='both A buttons')
                 self._publish_reactivate(True, reason='both A buttons', force_log=True)
             self.both_a_buttons_pressed_prev = both_a_now
 
@@ -1370,11 +1424,13 @@ class VRTrajectoryPublisher(Node):
                 )
                 self._btn_dbg_prev = _btn_dbg
             if both_b_now and not self.both_b_buttons_pressed_prev:
+                self.vr_publishing_enabled = False
                 self._publish_reactivate(False, reason='both B buttons', force_log=True)
             self.both_b_buttons_pressed_prev = both_b_now
 
             both_squeezes_now = self._both_squeezes_active()
             if both_squeezes_now and not self.both_squeezes_prev:
+                self._enable_vr_publishing(reason='both squeezes engaged')
                 self._publish_reactivate(
                     True, reason='both squeezes engaged', force_log=True
                 )
