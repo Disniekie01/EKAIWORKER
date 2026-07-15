@@ -1,502 +1,269 @@
-# AIWORKER
+# AI_HUN — VR Teleoperation 데이터 수집 오버레이
 
-Portable overlay for AI Worker Isaac Sim VR teleoperation tasks.
+> **AI Worker (ROBOTIS FFW) · Isaac Sim VR 원격조작(teleoperation) 데이터 수집·증강 파이프라인**
+> 사람이 Meta Quest 3로 로봇을 조종 → Isaac Sim에서 시연 녹화 → IsaacLab **Mimic**으로 대량 증강 → 학습용 **HDF5** 산출.
 
-This repo is intentionally small. It does not vendor the full ROBOTIS repositories and it does not include recorded datasets. Instead, `setup.sh` clones the required upstream repos at pinned commits, initializes `cyclo_lab` submodules, and copies the AIWORKER overlay files on top.
+이 레포는 **"오버레이(overlay)" 레포**입니다. ROBOTIS 원본 저장소 전체를 담지 않고, 녹화·증강용 로컬 수정본만 `overlays/`에 담습니다. `setup.sh`가 원본 3개를 **고정 커밋(pinned commit)** 으로 클론한 뒤, 그 위에 이 레포의 오버레이를 덮어씁니다.
 
-**SG2 L-table data + checkpoint:** [Release sg2-ltable-20260702](https://github.com/Disniekie01/EKAIWORKER/releases/tag/sg2-ltable-20260702)
+- **레포 크기가 작은 이유**: 업스트림 원본과 녹화 데이터셋(수백 GB)은 **커밋에서 제외**됩니다. 클론한 머신에서 `setup.sh`로 재구성합니다.
+- **English TL;DR**: This is a thin *overlay* repo. `setup.sh` clones 3 upstream ROBOTIS repos at pinned commits, then rsyncs `overlays/` on top. Upstream sources and recorded HDF5 datasets are intentionally **not committed**.
 
-## 5-Minute Quickstart (Fresh Machine)
+---
 
-Use this if you just cloned and want a runnable state quickly.
+## 1. 전체 흐름 (End-to-End Flow)
 
-### 1) Clone + setup
+```
+[사람 + Meta Quest 3]
+      │  손/컨트롤러 포즈 (WebXR)
+      │  · WiFi:  vuer.ai  ↔  wss://<PC-IP>:8012
+      │  · USB :  adb reverse  ↔  wss://localhost:8012   (지터 낮음, 녹화 권장)
+      ▼
+[robotis-applications 컨테이너]  Vuer VR Publisher  (:8012)
+      │  ROS 2 포즈 토픽 (DDS / FastRTPS, ROS_DOMAIN_ID=30)
+      ▼
+[ai_worker 컨테이너]  vr_controller (IK 모션 컨트롤러)
+      │  관절 명령 (DDS)
+      ▼
+[cyclo_lab 컨테이너]  Isaac Sim 5.1.0 + IsaacLab 2.3.0 + record_demos.py
+      │  시연 녹화
+      ▼
+   *_raw.hdf5  ──► IK 변환 ──► Annotate ──► Mimic Datagen(500개 증강) ──► Joint 변환 ──► (LeRobot)
+                                                                              │
+                                                                              ▼
+                                                                     학습용 HDF5 데이터셋
+```
+
+전 과정은 **`cyclo_lab` 대시보드(`http://localhost:8765`)** 에서 버튼으로 오케스트레이션됩니다.
+
+---
+
+## 2. 버전 스펙 (Version Spec) ⭐
+
+세팅 시 **이 버전 조합**을 맞춰야 태스크 등록/IsaacLab API가 호환됩니다.
+
+| 구성요소 | 버전 | 비고 |
+|---|---|---|
+| **NVIDIA Isaac Sim** | **5.1.0** | 물리·렌더 엔진. `docker/.env`의 `ISAACSIM_VERSION=5.1.0`으로 핀. 베이스 이미지 `nvcr.io/nvidia/isaac-sim` |
+| **NVIDIA Isaac Lab** | **2.3.0** | 태스크 정의·Recorder Manager·HDF5 데이터셋 프레임워크. `cyclo_lab/third_party/IsaacLab` 서브모듈 |
+| ├ `isaaclab` | 0.47.2 | 코어 |
+| ├ `isaaclab_mimic` | 1.0.15 | **데이터 증강(datagen)** |
+| ├ `isaaclab_tasks` | 0.11.6 | 태스크 |
+| ├ `isaaclab_rl` | 0.4.4 | RL |
+| └ `isaaclab_assets` | 0.2.3 | 에셋 |
+| **ROS 2** | **Jazzy Jalisco** | 컨테이너 간 통신. RMW = `rmw_fastrtps_cpp` (Fast DDS), `ROS_DOMAIN_ID=30` |
+| **Vuer (WebXR)** | 컨테이너 내장 | VR 브릿지, 포트 **8012** |
+| **Meta Quest 3** | — | WebXR 브라우저로 접속 (앱 설치 불필요) |
+
+### 컨테이너 이미지 (Docker)
+
+| 컨테이너 | 이미지 | 역할 | 포트 |
+|---|---|---|---|
+| `cyclo_lab` | `cyclolab/cyclo-lab:latest` (Isaac Sim 5.1.0 base) | Isaac Sim·녹화·Mimic 파이프라인·대시보드 | **8765** |
+| `robotis-applications` | `robotis/robotis-applications:1.0.0` | Vuer VR Publisher | **8012** |
+| `ai_worker` | `robotis/ai-worker:2.0.0` | vr_controller (IK 모션) | — |
+
+### 검증된 하드웨어 (Reference HW)
+
+| 항목 | 사양 |
+|---|---|
+| CPU | Intel Core Ultra 9 285HX |
+| GPU | **NVIDIA RTX PRO 5000 Blackwell Laptop (24GB)** |
+| OS | Ubuntu / Pop!_OS (Linux) + NVIDIA Container Toolkit |
+
+### 업스트림 고정 커밋 (Upstream Pins — `setup.sh` 기준)
+
+| 원본 | 커밋 |
+|---|---|
+| `cyclo_lab` | `a5ea01967b145f839ca1ac8f51b42abf9ef87036` |
+| `ai_worker` | `e8c2eacb612e47473cdf03e44bee6d527c00b4f9` |
+| `robotis_applications` | `7ef0aabc748174cb91013866b2e4142122ef475c` |
+
+---
+
+## 3. 클론 & 설치 (Clone & Setup)
+
+### 3-1. 이 레포 클론 + 원본 자동 구성
 
 ```bash
-git clone https://github.com/Disniekie01/EKAIWORKER.git AIWORKER
+# 1) 이 레포(오버레이) 클론
+git clone https://github.com/hun7407-lgtm/AI_HUN.git AIWORKER
 cd AIWORKER
+
+# 2) setup.sh 실행: 원본 3개를 고정 커밋으로 클론 + 서브모듈 초기화 + 오버레이 적용
 ./setup.sh ~/AIWORKER
 ```
 
-### 2) Start containers
+`setup.sh ~/AIWORKER` 실행 후 생성되는 구조:
 
-```bash
-cd ~/AIWORKER/cyclo_lab/docker && ./container.sh start
-cd ~/AIWORKER/robotis_applications/docker && ./container.sh start
-cd ~/AIWORKER/ai_worker/docker && ./container.sh start
+```text
+~/AIWORKER/
+  cyclo_lab/              ← 원본 클론 + 오버레이 적용 (Isaac Sim/녹화/Mimic/대시보드)
+  ai_worker/              ← 원본 클론 (vr_controller)
+  robotis_applications/   ← 원본 클론 + 오버레이 적용 (Vuer)
 ```
 
-### 3) Enable GUI (host terminal)
+> 설치 경로는 자유롭게 지정 가능 (`./setup.sh /원하는/경로`).
+
+### 3-2. 컨테이너 시작
+
+```bash
+cd ~/AIWORKER/cyclo_lab/docker            && ./container.sh start
+cd ~/AIWORKER/robotis_applications/docker && ./container.sh start
+cd ~/AIWORKER/ai_worker/docker            && ./container.sh start
+```
+
+### 3-3. GUI 허용 (호스트 터미널)
 
 ```bash
 xhost +local:docker
 xhost +SI:localuser:root
+# Isaac 창이 안 뜨면: xhost +
 ```
 
-### 4) Start dashboard
+### 3-4. 대시보드 시작
 
 ```bash
 cd ~/AIWORKER/cyclo_lab
 python3 sg2_ltable_dashboard.py
 ```
 
-Open: `http://localhost:8765`
+브라우저에서 **`http://localhost:8765`** 접속 → Robot·Task 선택 → **Launch VR + Controller** (또는 **Launch Record**).
 
-Select a task, click **Launch VR + Controller**, then follow the **Meta Quest — headset connection** steps on the dashboard (cert at `https://<host-ip>:8012`, then `https://vuer.ai/?ws=wss://<host-ip>:8012` in a new tab).
+---
 
-### 5) Run first SG2 L-table play test
+## 4. VR 연결 (Meta Quest 3)
 
+대시보드가 스택을 실행하면, Quest 브라우저에서 Vuer(WebXR)로 접속합니다.
+
+| 서비스 | 주소 | 용도 |
+|---|---|---|
+| 대시보드 | `http://localhost:8765` | 태스크 선택·스택 실행·Mimic 파이프라인 |
+| Vuer (HTTPS) | `https://<PC-IP>:8012` | WebXR 페이지 |
+| Vuer (WebSocket) | `wss://<PC-IP>:8012` | 포즈/버튼 스트림 (반드시 `wss://`) |
+
+**WiFi — 2단계 (Quest 브라우저):**
+1. 인증서 수락: `https://<PC-IP>:8012` → **Advanced → Proceed**
+2. 새 탭: `https://vuer.ai/?ws=wss://<PC-IP>:8012` → **Enter VR** → 핸드트래킹 허용
+
+**USB(ADB reverse) — 오프라인, 지터 낮음 (녹화 권장):**
 ```bash
-docker exec -e DISPLAY=:1 -e TERM=xterm cyclo_lab bash -lc '
-cd /workspace/cyclo_lab
-./third_party/IsaacLab/isaaclab.sh -p scripts/imitation_learning/robomimic/play.py \
-  --device cuda \
-  --task Cyclo-Real-Pick-Place-LTable-FFW-SG2-v0 \
-  --checkpoint /PATH/TO/model_epoch_20.pth \
-  --num_rollouts 3 --horizon 2000 \
-  --enable_cameras --action_mode inference --scripted_l_motion
-'
+cd ~/AIWORKER/adb_vr_connect && ./connect.sh   # 케이블 뽑을 때마다 재실행
 ```
+Quest 브라우저: `https://localhost:8012?ws=wss://localhost:8012`
+→ 최초 1회 ADB/udev 세팅은 [`adb_vr_connect/README.md`](adb_vr_connect/README.md) 참고.
 
-If GUI does not appear, run:
+**로봇 제어 활성화:**
+- **SG2 (그리퍼)**: 양쪽 컨트롤러 그립을 **3초간 홀드** → teleop 활성화. 리프트는 오른쪽 썸스틱.
+- **SH5 (핸드)**: VR 퍼블리싱이 **비활성**으로 시작 → 핸드 제스처 또는 `/vr/reactivate` 토픽. 리프트는 Isaac 창에서 **I**/**O**.
 
+### 4-1. VR ↔ Isaac Sim 연결 안정화 루틴 (반복 체크리스트)
+
+녹화 세션마다 아래 순서를 그대로 반복하면 안정적으로 연결됩니다 (USB/ADB 기준).
+
+1. **USB로 PC ↔ VR 헤드셋 연결**
+2. **연결 스크립트 실행** — `~/AIWORKER/adb_vr_connect/connect.sh`
+3. 대시보드에서 **[Launch VR + Controller]** 버튼 입력
+4. PC에서 **localhost(Vuer :8012) 실행 여부 확인**
+5. Meta Quest 브라우저에서 **localhost 접속** — `https://localhost:8012?ws=wss://localhost:8012`
+6. 대시보드 **[Launch Record]** 버튼 실행
+7. **Isaac Sim 실행 후** VR 브라우저의 localhost **연결 상태 재확인**
+8. Isaac Sim 창에서 **`B` 입력 → 컨트롤러 그립 약 3초 홀드**
+
+> **연결 실패 시**: `R` 입력 → 다시 `B` 입력 → 그립 3초 홀드 절차를 반복.
+
+**Task 수행 후 결과 확인:**
+- 만족스러운 결과 → **`N`** 입력으로 데이터 저장
+- 실패/불만족 → **`R`** 입력 후 재수행
+
+---
+
+## 5. 시연 녹화 (Recording) — Isaac 창 포커스
+
+**매 take마다 반복:**
+
+| 키 | 동작 |
+|---|---|
+| **B** | 녹화 시작 + arm teleop 활성 (**매 take 전에 필수**) |
+| (VR) | SG2: 양쪽 그립 3초 홀드 → teleop on |
+| **L** | 수동 L-motion (회전 후 L-테이블로 주행). 잡은 뒤 자동 트리거 가능 |
+| **N** | 에피소드 저장 |
+| **R** | take 폐기 후 재시작 (저장 안 됨) |
+
+원본 데이터셋: `~/AIWORKER/cyclo_lab/datasets/*_raw.hdf5`
+- SG2 액션 = 19차원 / SH5 액션 = 57차원 (양팔 + 손가락 20관절×2 + 헤드 + 리프트)
+
+---
+
+## 6. Mimic 파이프라인 (데이터 증강)
+
+녹화한 `*_raw.hdf5`를 대시보드 **Mimic pipeline** 섹션에서 **한 번에 하나씩 순서대로** 실행 (각 단계 완료 후 다음):
+
+| 단계 | 입력 → 출력 | 설명 |
+|---|---|---|
+| 1. IK convert | `raw → ik` | 관절 녹화를 IK(엔드이펙터) 액션으로 변환 |
+| 2. Annotate | `ik → annotate` | 서브태스크 구간(grasp/move/place) 라벨링 |
+| 3. **Datagen** | `annotate → generate` | **소수 시연 → 수백 개 합성** (기본 500개, `cyclo_mimic_datagen.py`) |
+| 4. Joint convert | `generate → joint` | robomimic 학습용 관절 액션 HDF5 |
+| 5. LeRobot export | `joint → lerobot` | (선택) ACT/LeRobot용 |
+
+**튜닝 (대시보드 시작 전):**
 ```bash
-xhost +
+export GENERATION_NUM_TRIALS=500   # datagen 에피소드 수 (기본 500)
+export PIPELINE_NUM_ENVS=10        # datagen 병렬 Isaac 환경 수 (기본 10)
 ```
 
-Then retry the play command.
-
-## End-to-End: Record -> Pipeline -> Train -> Play
-
-Use this exact flow for a new task run (example: SG2 L-table).
-
-### 1) Record demos (dashboard)
-
-Start the dashboard:
-
+**단계별 로그:**
 ```bash
-cd ~/AIWORKER/cyclo_lab
-python3 sg2_ltable_dashboard.py
-```
-
-Open `http://localhost:8765`, select your task, launch the stack, connect VR (see [VR Teleoperation](#vr-teleoperation--how-to-connect)), and record demos.
-
-**Recording workflow (each take):**
-
-| Step | Control | Action |
-|------|---------|--------|
-| 1 | **B** (Isaac window) | Start recording + activate arm teleop for this take |
-| 2 | Both VR grips ~3s | Enable VR teleop (SG2) |
-| 3 | Pick box | Base auto-turns/drives to L-table once gripped (or **L** manually) |
-| 4 | **N** | Save episode if happy with the take |
-| 4 alt | **R** | Discard take and restart (not saved) |
-
-Press **B** before every new take. Raw dataset: `~/AIWORKER/cyclo_lab/datasets/*_raw.hdf5`.
-
-### 2) Run Mimic pipeline (dashboard)
-
-After recording, run these **one at a time** in the dashboard **Mimic pipeline** section (wait for each to finish):
-
-| Step | Input → output | What it does |
-|------|----------------|--------------|
-| **1. IK convert** | `raw → ik` | Convert joint recordings to IK (end-effector) actions |
-| **2. Annotate** | `ik → annotate` | Label subtask segments (grasp, move, place) for Mimic |
-| **3. Datagen** | `annotate → generate` | Synthesize many demos by replaying segments + L-motion |
-| **4. Joint convert** | `generate → joint` | Convert to joint-action HDF5 for robomimic training |
-| **5. LeRobot export** | `joint → lerobot` | Optional — for ACT/LeRobot only (skip for robomimic) |
-
-
-### 3) Train robomimic
-
-```bash
-docker exec -it cyclo_lab bash -lc '
-cd /workspace/cyclo_lab
-./third_party/IsaacLab/isaaclab.sh -p scripts/imitation_learning/robomimic/train.py \
-  --task Cyclo-Real-Pick-Place-LTable-FFW-SG2-v0 \
-  --algo bc \
-  --dataset ./datasets/ffw_sg2_l_table_joint.hdf5 \
-  --name ffw_sg2_l_table_bc
-'
-```
-
-### 4) Play checkpoint
-
-```bash
-docker exec -e DISPLAY=:1 -e TERM=xterm -it cyclo_lab bash -lc '
-cd /workspace/cyclo_lab
-./third_party/IsaacLab/isaaclab.sh -p scripts/imitation_learning/robomimic/play.py \
-  --device cuda \
-  --task Cyclo-Real-Pick-Place-LTable-FFW-SG2-v0 \
-  --checkpoint /workspace/cyclo_lab/logs/robomimic/Cyclo-Real-Pick-Place-LTable-FFW-SG2-v0/ffw_sg2_l_table_bc/<run_id>/models/model_epoch_20.pth \
-  --num_rollouts 3 --horizon 2000 \
-  --enable_cameras --action_mode inference --scripted_l_motion
-'
-```
-
-## What This Adds
-
-- `cyclo_lab` dashboard for launching the stack, selecting tasks, and running the Mimic pipeline step-by-step.
-- SG2 basket pick-place, L-table, box-stack, single-box-far, and thick-box variants (record + Mimic for SG2).
-- SH5 hand versions of the same tasks (record + Mimic).
-- SH5 DDS recorder support for VR hand teleoperation.
-- Task-specific table/box assets and teleop motion settings.
-- Minor `robotis_applications` VR publisher update used by this setup.
-- `adb_vr_connect/` — Meta Quest 3 USB tethering via ADB reverse port forwarding (lower jitter than WiFi).
-
-## Upstream Pins
-
-- `cyclo_lab`: `a5ea01967b145f839ca1ac8f51b42abf9ef87036`
-- `ai_worker`: `e8c2eacb612e47473cdf03e44bee6d527c00b4f9`
-- `robotis_applications`: `7ef0aabc748174cb91013866b2e4142122ef475c`
-
-## Install On A New Machine
-
-```bash
-git clone https://github.com/Disniekie01/EKAIWORKER.git AIWORKER
-cd AIWORKER
-./setup.sh ~/AIWORKER
-```
-
-The install directory can be any path. The command above creates:
-
-```text
-~/AIWORKER/
-  cyclo_lab/
-  ai_worker/
-  robotis_applications/
-```
-
-## Start Containers
-
-```bash
-cd ~/AIWORKER/cyclo_lab/docker
-./container.sh start
-
-cd ~/AIWORKER/robotis_applications/docker
-./container.sh start
-
-cd ~/AIWORKER/ai_worker/docker
-./container.sh start
-```
-
-## Start Dashboard
-
-```bash
-cd ~/AIWORKER/cyclo_lab
-python3 sg2_ltable_dashboard.py
-```
-
-Open the dashboard at:
-
-```text
-http://localhost:8765
-```
-
-**Paste in Meta Quest Browser (WiFi) — two steps:**
-
-```text
-Step 1 (accept cert):  https://<host-ip>:8012
-Step 2 (new tab, VR):  https://vuer.ai/?ws=wss://<host-ip>:8012
-```
-
-The dashboard **Meta Quest — headset connection** box shows your PC IP after **Launch VR + Controller**. USB/ADB uses `localhost` — see [VR Teleoperation](#vr-teleoperation--how-to-connect).
-
-Select the task, then launch the stack from the dashboard.
-
-### Mimic pipeline (dashboard)
-
-After recording a raw `.hdf5` for the selected task, use the **Mimic pipeline** section on the dashboard (`http://localhost:8765`). Run steps **one at a time** in order and wait for each to finish before starting the next:
-
-1. **IK convert** — `*_raw.hdf5` → `*_ik.hdf5`
-2. **Annotate** — `*_ik.hdf5` → `*_annotate.hdf5`
-3. **Datagen** — `*_annotate.hdf5` → `*_generate.hdf5` (uses `cyclo_mimic_datagen.py` for lift/head + L-motion replay)
-4. **Joint convert** — `*_generate.hdf5` → `*_joint.hdf5`
-5. **LeRobot export** — `*_joint.hdf5` → LeRobot dataset
-
-Each button shows its status (`stopped` / `starting` / `running`) and whether the input file exists. Only one pipeline step runs at a time. **Run all steps sequentially** chains the five steps with waits between them.
-
-Pipeline jobs run headless inside the `cyclo_lab` container. Start that container first. Per-step logs:
-
-```bash
-docker exec cyclo_lab tail -f /tmp/sg2_ltable_pipe_ik.log
+docker exec cyclo_lab tail -f /tmp/sg2_ltable_pipe_generate.log
 # ik | annotate | generate | joint | lerobot
 ```
 
-Optional tuning via environment variables before starting the dashboard:
+수동 실행(컨테이너 내부) 예시는 이 레포의 [`OPERATIONS.md`](OPERATIONS.md) 또는 상세 커맨드를 참고 (SG2/SH5 각각).
+
+---
+
+## 7. ⚠️ 주의사항 (Cautions)
+
+- **버전 조합을 바꾸지 말 것**: Isaac Sim 5.1.0 / IsaacLab 2.3.0 조합이 검증됨. 업스트림 커밋을 바꾸면 태스크 등록·IsaacLab API가 어긋날 수 있으니 오버레이를 **반드시 재테스트**.
+- **원본·데이터셋은 커밋 금지**: `cyclo_lab/`, `ai_worker/`, `robotis_applications/`(루트), `datasets/`, `*.hdf5`는 `.gitignore`로 제외됨. `git add -A` 시에도 절대 스테이징되지 않게 관리. (수백 GB)
+- **오버레이가 진실의 원천(source of truth)**: 로컬 수정은 `overlays/`에서 관리. 라이브 체크아웃에 직접 수정했다면 `./pull_overlay.sh`로 되가져오고, 배포 시 `./sync_overlay.sh`로 덮어씀.
+- **컨테이너 3개 모두 실행 필수**: VR(8012)·컨트롤러·녹화가 각각 다른 컨테이너. `ROS_DOMAIN_ID=30`으로 연결되므로 값이 어긋나면 서로 못 봄.
+- **`wss://` 일치**: 페이지가 `https://`면 WebSocket도 반드시 `wss://` (혼합 콘텐츠 오류 방지).
+- **녹화 중 지터**: WiFi 지터가 팔 떨림으로 나타남 → **USB ADB 테더링** 권장. GPU/CPU 전력·발열 스로틀도 프레임드랍 원인이 될 수 있음.
+- **NVIDIA Docker 전제**: NVIDIA Container Toolkit 및 Isaac Sim 컨테이너 요구사항이 이미 충족되어 있다고 가정.
+- **`docker/.env` 포함**: 개발 시 사용한 Isaac Sim 5.1 설정이 핀되어 있음.
+
+---
+
+## 8. 오버레이 동기화 (Overlay Sync)
 
 ```bash
-export GENERATION_NUM_TRIALS=500   # datagen episode count (default 500)
-export PIPELINE_NUM_ENVS=10        # parallel Isaac envs during datagen (default 10)
+# 오버레이 → 라이브 체크아웃에 적용
+./sync_overlay.sh ~/AIWORKER/cyclo_lab
+
+# 라이브 체크아웃 수정본 → 오버레이로 되가져오기 (역방향)
+./pull_overlay.sh ~/AIWORKER/cyclo_lab
 ```
 
-HDF5 paths are derived from the task raw dataset name (e.g. `ffw_sg2_l_table_raw.hdf5` → `ffw_sg2_l_table_ik.hdf5`, etc.). The dashboard uses each task's `mimic_id` for annotate/datagen and the record task id for LeRobot export.
+`manifest.json`의 업스트림 커밋은 부트스트랩 핀입니다. 실제 teleop 수정본은 `overlays/`에 담깁니다.
 
-## VR Teleoperation — How to Connect
+---
 
-VR teleop uses **Vuer** (WebXR) in the Meta Quest browser. The dashboard starts the full stack; you open Vuer on the headset and control the sim robot from there.
-
-### URLs and ports
-
-| Service | Address | Purpose |
-|---------|---------|---------|
-| **Dashboard** | `http://localhost:8765` | Task picker, launch VR/controller/recorder, mimic pipeline |
-| **Vuer (HTTPS)** | `https://<host-ip>:8012` | WebXR page served by `robotis_vuer` |
-| **Vuer (WebSocket)** | `wss://<host-ip>:8012` | Pose/button stream (must use `wss://` with `https://`) |
-
-Replace `<host-ip>` with your PC’s LAN address. The dashboard prints it after **Launch VR + Controller** (first address from `hostname -I`, e.g. `192.168.1.42`).
-
-**WiFi — two steps in Meta Quest Browser:**
-
-1. **Accept certificate** — open `https://<host-ip>:8012` → **Advanced → Proceed (unsafe)**
-2. **New tab** — open the Vuer client (connects WebSocket to your PC):
-   ```text
-   https://vuer.ai/?ws=wss://<host-ip>:8012
-   ```
-3. **Enter VR** → allow hand tracking
-
-Example step 2:
+## 9. 레포 구조 (Repo Layout)
 
 ```text
-https://vuer.ai/?ws=wss://192.168.1.42:8012
+AI_HUN/
+├── setup.sh              # 원본 3개 클론(핀) + 서브모듈 + 오버레이 적용
+├── sync_overlay.sh       # 오버레이 → 라이브 적용
+├── pull_overlay.sh       # 라이브 → 오버레이 회수
+├── run_dashboard.sh      # 대시보드 실행 헬퍼
+├── manifest.json         # 업스트림 URL·커밋 핀
+├── overlays/
+│   ├── cyclo_lab/          # 녹화·Mimic·대시보드·태스크/에셋 수정본
+│   └── robotis_applications/  # Vuer 퍼블리셔 수정본
+└── adb_vr_connect/        # Meta Quest 3 USB(ADB) 테더링 (connect.sh + 가이드)
 ```
 
-**USB tethered Quest (ADB reverse — offline, no vuer.ai):**
+---
 
-1. Accept cert at `https://localhost:8012`
-2. New tab: `https://localhost:8012?ws=wss://localhost:8012`
-
-See [Meta Quest 3 USB (ADB) setup](adb_vr_connect/README.md) for one-time ADB/udev setup and `adb_vr_connect/connect.sh`.
-
-### What the dashboard launches
-
-Containers (all must be running):
-
-| Container | Role |
-|-----------|------|
-| `cyclo_lab` | Isaac Sim recorder / mimic pipeline |
-| `robotis-applications` | Vuer VR publisher (`ros2 launch robotis_vuer vr.launch.py`, port **8012**) |
-| `ai_worker` | Motion controller (`cyclo_motion_controller_ros`, `controller_type:=vr`) |
-
-Robot-specific launch (picked automatically from task):
-
-| Robot | VR model | Controller | Notes |
-|-------|----------|------------|-------|
-| **SG2 (gripper)** | `model:=sg2` | `hand:=false` | Lift on right thumbstick |
-| **SH5 (hands)** | `model:=sh5` | `hand:=true` | VR lift publishing off; use **I**/**O** in Isaac |
-
-`ROS_DOMAIN_ID=30` (default). Optional: `VR_IMAGE=1` before starting the dashboard enables stereo passthrough background in the headset.
-
-### WiFi connection (every session)
-
-1. Start all three containers (see [Start Containers](#start-containers)).
-2. Enable GUI: `xhost +local:docker` (and `xhost +` if Isaac window fails).
-3. Start the dashboard: `python3 sg2_ltable_dashboard.py` → open `http://localhost:8765`.
-4. Select **Robot** and **Task**.
-5. Click **Launch VR + Controller** (teleop only) or **Launch Record** (teleop + Isaac recorder).
-6. Wait until dashboard shows `vr: running` and `ai: running`, and the **Meta Quest — headset connection** box appears.
-7. On the Quest (same WiFi), **Step 1:** open `https://<host-ip>:8012` → accept certificate.
-8. **Step 2:** new browser tab → `https://vuer.ai/?ws=wss://<host-ip>:8012`
-9. Click **Enter VR** and allow hand tracking.
-10. Confirm the Vuer terminal log in the `robotis-applications` container shows a client connected.
-
-### USB / ADB connection (recommended for recording)
-
-Lower latency jitter than WiFi; no router between Quest and PC.
-
-1. Complete [one-time ADB setup](adb_vr_connect/README.md) (udev rule, USB debugging).
-2. Plug Quest into the PC with a **USB 3.0 data cable**.
-3. Start Vuer from the dashboard (**Launch VR + Controller** or **Launch Record**).
-4. Run the tether script:
-   ```bash
-   cd ~/AIWORKER/adb_vr_connect
-   ./connect.sh
-   ```
-5. In Meta Quest Browser open:
-   `https://localhost:8012?ws=wss://localhost:8012`
-6. Accept cert → **Enter VR** → allow hand tracking.
-
-Re-run `./connect.sh` after every USB reconnect (`adb reverse` resets on unplug).
-
-### Enable robot control after connecting
-
-**SG2 (gripper):** **Hold both controller grips for ~3 seconds** to enable VR teleop (release disables it).
-
-**SH5 (hands):** VR publishing starts **disabled**. Enable with the SH5 hand gesture, or:
-
-```bash
-docker exec -it robotis-applications bash
-export ROS_DOMAIN_ID=30
-source /opt/ros/jazzy/setup.bash
-source /root/ros2_ws/install/setup.bash
-ros2 topic pub --once /vr/reactivate std_msgs/msg/Bool "{data: true}"
-```
-
-**SH5 lift:** VR does not publish lift for hand tasks. Adjust from the Isaac Sim window: **I** (up) / **O** (down), range about **−0.40 m to 0.0 m** (reset pose ~−0.25 m).
-
-**SG2 lift:** Right thumbstick on the VR controller.
-
-### Recording demos (Isaac window focus)
-
-**Each take — repeat this cycle:**
-
-1. Press **B** — start recording and activate arm teleop for this episode (required before every take).
-2. In VR (SG2): **hold both controller grips for ~3 seconds** to enable teleop.
-3. Pick the box — once gripped, the base **auto-turns and drives** toward the L-table (or press **L** manually).
-4. **N** — save the episode if you are happy with the take.
-5. **R** — discard the take and restart (episode is not saved).
-
-| Key | Action |
-|-----|--------|
-| **B** | Start recording + teleop (press before each take) |
-| **N** | Save episode |
-| **R** | Discard and restart |
-| **L** | Manual L-motion (rotate + drive to table) |
-
-L-motion uses kinematic root teleport (swerve off) so carried boxes stay stable. After gripping ~2 s, L-motion can auto-start when `teleop_auto_l_on_grip_s` is set on the task.
-
-When the env `success` termination fires (box placed), the recorder auto-saves if **B** is active and dashboard **Save episode** is set to **Auto on task success**.
-
-Raw datasets are written to `~/AIWORKER/cyclo_lab/datasets/*_raw.hdf5`. The recorder runs inside the `cyclo_lab` container at `/workspace/cyclo_lab` — host edits must be visible there (sync overlay if needed).
-
-### VR troubleshooting
-
-| Symptom | Fix |
-|---------|-----|
-| Quest cannot reach Vuer | Same WiFi as PC; check firewall on port **8012**; confirm `robotis-applications` container is up |
-| Mixed-content / WebSocket error | Use `wss://` in `ws=` when the page is `https://` |
-| Certificate warning | **Advanced → Proceed** on Quest browser |
-| Robot does not move (SH5) | Enable publishing (gesture or `/vr/reactivate`) |
-| Robot does not move (SG2) | Squeeze both grips |
-| Stuttery teleop on WiFi | Switch to [USB ADB tethering](adb_vr_connect/README.md) |
-| `adb devices` shows `no permission` | Follow udev steps in `adb_vr_connect/README.md` |
-| Isaac GUI missing | `xhost +` on host, `DISPLAY=:1` in container |
-
-ROBOTIS upstream reference: [VR teleoperation guide](https://docs.robotis.com/docs/systems/aiworker/quick_start_guide/operation_guide/vr_teleoperation).
-
-## Datasets
-
-Recorded `.hdf5` datasets are intentionally excluded. Re-record demonstrations on the target machine using the dashboard.
-
-SG2 actions stay 19-dimensional (`gripper_l_joint1` only). SH5 actions are 57-dimensional (arms + 20 finger joints per hand + head + lift).
-
-### SG2 Mimic pipeline (after recording)
-
-Each SG2 dashboard task has a matching `Cyclo-Real-Mimic-*` env (see task `mimic_id` in `sg2_ltable_dashboard.py`). You can run the full flow from the dashboard **Mimic pipeline** section, or manually inside the `cyclo_lab` container. Example for L-table:
-
-```bash
-# Inside cyclo_lab container
-RAW=./datasets/ffw_sg2_l_table_raw.hdf5
-IK=./datasets/ffw_sg2_l_table_ik.hdf5
-
-python scripts/sim2real/imitation_learning/mimic/action_data_converter.py \
-  --robot_type FFW_SG2 --input_file "$RAW" --output_file "$IK" --action_type ik
-
-python scripts/sim2real/imitation_learning/mimic/annotate_demos.py \
-  --task Cyclo-Real-Mimic-Pick-Place-LTable-FFW-SG2-v0 --auto \
-  --input_file "$IK" --output_file ./datasets/ffw_sg2_l_table_annotate.hdf5 --enable_cameras --headless
-
-python scripts/sim2real/imitation_learning/mimic/generate_dataset.py \
-  --device cuda --num_envs 10 --task Cyclo-Real-Mimic-Pick-Place-LTable-FFW-SG2-v0 \
-  --generation_num_trials 500 --input_file ./datasets/ffw_sg2_l_table_annotate.hdf5 \
-  --output_file ./datasets/ffw_sg2_l_table_generate.hdf5 --enable_cameras --headless
-
-python scripts/sim2real/imitation_learning/mimic/action_data_converter.py \
-  --robot_type FFW_SG2 --input_file ./datasets/ffw_sg2_l_table_generate.hdf5 \
-  --output_file ./datasets/ffw_sg2_l_table_joint.hdf5 --action_type joint
-```
-
-Basket pick-place uses `Cyclo-Real-Mimic-Pick-Place-FFW-SG2-v0` (upstream env, not in overlay).
-
-### SH5 Mimic pipeline (after recording)
-
-Same steps as SG2 (dashboard pipeline or manual commands). Use `--robot_type FFW_SH5` and the SH5 `mimic_id` from the dashboard (e.g. `Cyclo-Real-Mimic-Pick-Place-LTable-FFW-SH5-v0`). IK actions are 57-dim: both arm EEF poses plus all finger/head/lift joints. During datagen, finger poses are taken from `joint_pos_target` in source demos (not the 1D curl proxy in the Mimic API).
-
-```bash
-RAW=./datasets/ffw_sh5_l_table_raw.hdf5
-IK=./datasets/ffw_sh5_l_table_ik.hdf5
-
-python scripts/sim2real/imitation_learning/mimic/action_data_converter.py \
-  --robot_type FFW_SH5 --input_file "$RAW" --output_file "$IK" --action_type ik
-
-python scripts/sim2real/imitation_learning/mimic/annotate_demos.py \
-  --task Cyclo-Real-Mimic-Pick-Place-LTable-FFW-SH5-v0 --auto \
-  --input_file "$IK" --output_file ./datasets/ffw_sh5_l_table_annotate.hdf5 --enable_cameras --headless
-
-python scripts/sim2real/imitation_learning/mimic/generate_dataset.py \
-  --device cuda --num_envs 10 --task Cyclo-Real-Mimic-Pick-Place-LTable-FFW-SH5-v0 \
-  --generation_num_trials 500 --input_file ./datasets/ffw_sh5_l_table_annotate.hdf5 \
-  --output_file ./datasets/ffw_sh5_l_table_generate.hdf5 --enable_cameras --headless
-
-python scripts/sim2real/imitation_learning/mimic/action_data_converter.py \
-  --robot_type FFW_SH5 --input_file ./datasets/ffw_sh5_l_table_generate.hdf5 \
-  --output_file ./datasets/ffw_sh5_l_table_joint.hdf5 --action_type joint
-
-lerobot-python scripts/sim2real/imitation_learning/data_converter/isaaclab2lerobot.py \
-  --task=Cyclo-Real-Pick-Place-LTable-FFW-SH5-v0 \
-  --robot_type FFW_SH5 \
-  --dataset_file ./datasets/ffw_sh5_l_table_joint.hdf5
-```
-
-SG2 LeRobot export (after joint convert):
-
-```bash
-lerobot-python scripts/sim2real/imitation_learning/data_converter/isaaclab2lerobot.py \
-  --task=Cyclo-Real-Pick-Place-LTable-FFW-SG2-v0 \
-  --robot_type FFW_SG2 \
-  --dataset_file ./datasets/ffw_sg2_l_table_joint.hdf5
-```
-
-### Sim inference (VR + DDS SDK)
-
-Run a task env with the teleop SDK in **inference** mode (`B` enable control, `R` reset, `L` L-motion; SH5 lift via **I**/**O**):
-
-```bash
-python scripts/sim2real/imitation_learning/inference/inference_demos.py \
-  --task Cyclo-Real-Pick-Place-LTable-FFW-SH5-v0 \
-  --robot_type FFW_SH5 --enable_cameras
-```
-
-SG2: `--robot_type FFW_SG2` and the matching `Cyclo-Real-*-FFW-SG2-v0` task id.
-
-### Robomimic play (L-table, SG2)
-
-For L-table policy evaluation, use robomimic play with SG2 action remap and optional scripted base L-motion:
-
-```bash
-python scripts/imitation_learning/robomimic/play.py \
-  --device cuda \
-  --task Cyclo-Real-Pick-Place-LTable-FFW-SG2-v0 \
-  --checkpoint /PATH/TO/model_epoch_20.pth \
-  --num_rollouts 10 --horizon 2000 \
-  --enable_cameras --action_mode inference \
-  --scripted_l_motion
-```
-
-Flags:
-- `--action_mode inference`: initializes SG2 real-task action terms
-- `--remap_ffw_sg2_actions`: swaps head/lift action indices for SG2 19-dim joint datasets
-- `--scripted_l_motion`: runs base rotate+forward L-motion in play after grasp latch
-
-## Overlay Sync
-
-`overlays/cyclo_lab/` is the source of truth for AIWORKER changes.
-
-Push overlay onto a live checkout:
-
-```bash
-./sync_overlay.sh ~/path/to/cyclo_lab
-```
-
-Pull edits made directly in `cyclo_lab` back into the overlay:
-
-```bash
-./pull_overlay.sh ~/path/to/cyclo_lab
-```
-
-Fresh installs use `./setup.sh`, which clones upstream pins and rsyncs the overlay automatically. Upstream commit hashes in `manifest.json` are bootstrap pins; teleop fixes ship in the overlay.
-
-## Notes
-
-- This overlay assumes NVIDIA Docker and Isaac Sim container requirements are already satisfied.
-- `cyclo_lab/docker/.env` is included to pin Isaac Sim 5.1 settings used during development.
-- If you change upstream commits, re-test the overlay because task registration and IsaacLab APIs may move.
+*ROBOTIS 업스트림 참고: [VR teleoperation guide](https://docs.robotis.com/docs/systems/aiworker/quick_start_guide/operation_guide/vr_teleoperation)*

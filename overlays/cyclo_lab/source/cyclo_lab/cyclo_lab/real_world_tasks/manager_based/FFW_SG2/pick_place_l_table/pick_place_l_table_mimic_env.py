@@ -88,6 +88,9 @@ class FFWSG2PickPlaceLTableMimicEnv(FFWSG2PickPlaceMimicEnv):
         self._l_motion_ctrl = LTableKinematicLMotion(self)
         self._mimic_recorded_state: tuple[EpisodeData, int] | None = None
         self._mimic_carry_latch: bool = False
+        # Per-env variants used by the multi-env (num_envs > 1) datagen path.
+        self._mimic_recorded_states: dict[int, tuple[EpisodeData, int]] = {}
+        self._mimic_carry_latch_envs: set[int] = set()
         self._kinematic_step_last_time: float | None = None
         self._last_step_was_kinematic: bool = False
 
@@ -95,6 +98,8 @@ class FFWSG2PickPlaceLTableMimicEnv(FFWSG2PickPlaceMimicEnv):
         self._mimic_body_joint_cmd = None
         self._mimic_recorded_state = None
         self._mimic_carry_latch = False
+        self._mimic_recorded_states = {}
+        self._mimic_carry_latch_envs = set()
         self._kinematic_step_last_time = None
         self._last_step_was_kinematic = False
         self._l_motion_ctrl.reset()
@@ -103,6 +108,14 @@ class FFWSG2PickPlaceLTableMimicEnv(FFWSG2PickPlaceMimicEnv):
         return ret
 
     def step(self, action: torch.Tensor) -> VecEnvStepReturn:
+        # num_envs == 1 keeps the validated single-env kinematic path untouched.
+        # num_envs > 1 needs per-env handling because a shared physics step cannot
+        # mix "teleport (no physics)" and "grasp (physics)" envs in one call.
+        if self.num_envs > 1:
+            return self._multi_env_step(action)
+        return self._legacy_step(action)
+
+    def _legacy_step(self, action: torch.Tensor) -> VecEnvStepReturn:
         action = self._inject_mimic_body_joints(action)
         recorded = self._mimic_recorded_state
         carry_latch = self._mimic_carry_latch
@@ -118,6 +131,38 @@ class FFWSG2PickPlaceLTableMimicEnv(FFWSG2PickPlaceMimicEnv):
             self._l_motion_ctrl.reset()
         self._last_step_was_kinematic = False
         return super(FFWSG2PickPlaceMimicEnv, self).step(action)
+
+    def _multi_env_step(self, action: torch.Tensor) -> VecEnvStepReturn:
+        """Per-env datagen step: physics for all envs, then teleport-override L-motion envs.
+
+        The action already carries per-env lift/head (baked by the datagen coroutine),
+        so it is NOT re-injected here (that would overwrite all rows with one env's cmd).
+        Recorded root/box replay is applied only to the envs that requested it this step.
+        """
+        recorded = dict(self._mimic_recorded_states)
+        carry_ids = set(self._mimic_carry_latch_envs)
+        self._mimic_recorded_states = {}
+        self._mimic_carry_latch_envs = set()
+
+        ret = super(FFWSG2PickPlaceMimicEnv, self).step(action)
+
+        if not recorded:
+            return ret
+
+        for env_id, (episode, state_index) in recorded.items():
+            env_ids = torch.tensor([env_id], device=self.device)
+            if env_id in carry_ids:
+                self._l_motion_ctrl.update_carry_latch(env_ids)
+                if bool(self._l_motion_ctrl.is_l_motion_latched(env_ids).any()):
+                    apply_recorded_robot_root_state(self, episode, state_index, env_ids=env_ids)
+                    self._l_motion_ctrl.apply_latched_carry(env_ids)
+            else:
+                self._l_motion_ctrl.clear_carry(env_ids)
+
+        self.sim.forward()
+        # Refresh obs so the datagen coroutine reads the post-override state.
+        self.obs_buf = self.observation_manager.compute()
+        return ret
 
     def _recorded_state_kinematic_step(
         self, action: torch.Tensor, episode: EpisodeData, state_index: int, *, carry_latch: bool = False

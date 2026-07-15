@@ -82,9 +82,21 @@ class LTableKinematicLMotion:
         return self._grasp_latch_candidates(env_ids)
 
     def _grasp_latch_candidates(
-        self, env_ids: torch.Tensor, *, diff_threshold: float = 0.18
+        self,
+        env_ids: torch.Tensor,
+        *,
+        midpoint_threshold: float = 0.20,
+        min_sep: float = 0.20,
+        max_sep: float = 0.42,
     ) -> torch.Tensor:
-        """Both grippers closed and box near each eef (strict bimanual grasp)."""
+        """Strict bimanual grasp via hand symmetry (robust to eef wrist offset).
+
+        The eef frames sit ~0.35 m behind the fingers, so per-hand distance to the
+        box center is not a reliable grasp signal. Instead require: both grippers
+        closed, the box centered between the two hands (symmetry), and the hands
+        spread apart on the box. A hand that fails to grip shifts the midpoint or
+        the separation out of range, so this rejects one-handed / partial grasps.
+        """
         closed = self._grippers_closed_mask(env_ids)
         if not closed.any():
             return torch.zeros(len(env_ids), dtype=torch.bool, device=self.env.device)
@@ -95,10 +107,10 @@ class LTableKinematicLMotion:
         left_pos = left_eef.data.target_pos_w[env_ids, 0, :]
         right_pos = right_eef.data.target_pos_w[env_ids, 0, :]
         midpoint = (left_pos + right_pos) * 0.5
-        near_left = torch.linalg.vector_norm(box_pos - left_pos, dim=1) < diff_threshold
-        near_right = torch.linalg.vector_norm(box_pos - right_pos, dim=1) < diff_threshold
-        near_midpoint = torch.linalg.vector_norm(box_pos - midpoint, dim=1) < diff_threshold
-        return closed & near_left & near_right & near_midpoint
+        near_midpoint = torch.linalg.vector_norm(box_pos - midpoint, dim=1) < midpoint_threshold
+        sep = torch.linalg.vector_norm(left_pos - right_pos, dim=1)
+        sep_ok = (sep > min_sep) & (sep < max_sep)
+        return closed & near_midpoint & sep_ok
 
     def clear_carry(self, env_ids: torch.Tensor) -> None:
         self._ensure_carry_buffers()

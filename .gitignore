@@ -4,3 +4,11 @@ workspace/
 __pycache__/
 *.pyc
 .DS_Store
+
+# setup.sh가 클론해오는 업스트림 원본 + 데이터셋 (수백 GB) — 절대 커밋 금지
+# 오버레이(overlays/)만 이 레포에서 관리한다.
+/cyclo_lab/
+/ai_worker/
+/robotis_applications/
+datasets/
+*.hdf5
