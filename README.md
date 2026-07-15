@@ -82,6 +82,31 @@
 
 ## 3. 클론 & 설치 (Clone & Setup)
 
+### 3-0. 사전 준비 (Prerequisites) — 신규 머신 필수 ⭐
+
+> `setup.sh`는 **코드만** 재현합니다. 아래 하드웨어·환경은 **미리** 갖춰져 있어야 컨테이너가 뜹니다. `git clone`만으로는 안 됩니다.
+
+| 전제조건 | 설명 | 확인/설치 |
+|---|---|---|
+| **Linux 호스트** | Ubuntu / Pop!_OS 등 (검증: Linux + X11) | — |
+| **NVIDIA GPU + 드라이버** | RTX급 필수 (Isaac Sim이 무거움). 검증HW = RTX PRO 5000 24GB | `nvidia-smi` |
+| **Docker Engine** | 컨테이너 런타임 | `docker --version` |
+| **NVIDIA Container Toolkit** | 컨테이너가 GPU를 쓰게 함(nvidia-docker). **없으면 Isaac Sim 안 뜸** | `docker run --rm --gpus all nvidia/cuda:12.4.0-base-ubuntu22.04 nvidia-smi` |
+| **NGC 계정 + 로그인** | `container.sh start`가 `nvcr.io/nvidia/isaac-sim:5.1.0` 베이스를 pull해서 `Dockerfile.base`로 빌드함 → NGC 인증 필요 + EULA 동의 | `docker login nvcr.io` (Username: `$oauthtoken`, Password: NGC API 키) |
+| **디스크 용량** | 이미지 빌드 수십 GB + 녹화 데이터셋 수백 GB | `df -h` |
+| **Meta Quest 3 + ADB/udev** | USB 테더링 최초 1회 세팅 | [`adb_vr_connect/README.md`](adb_vr_connect/README.md) |
+
+> **참고**: 이 레포엔 녹화 데이터셋·학습 체크포인트가 없습니다(의도적 제외). 신규 머신에서는 **직접 녹화**해서 데이터를 새로 수집합니다.
+
+설치 요약 순서:
+
+```text
+[0] 사전 준비:  NVIDIA 드라이버 + Docker + NVIDIA Container Toolkit 설치, docker login nvcr.io
+[1] 코드:       git clone AI_HUN → ./setup.sh ~/AIWORKER
+[2] 컨테이너:    각 docker/ 에서 ./container.sh start   (첫 실행은 이미지 빌드로 오래 걸림)
+[3] 실행:       xhost +local:docker → python3 sg2_ltable_dashboard.py → http://localhost:8765
+```
+
 ### 3-1. 이 레포 클론 + 원본 자동 구성
 
 ```bash
