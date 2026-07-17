@@ -136,16 +136,41 @@ def main() -> int:
         changes.append(f"{module} 휠 충돌 ON")
         info(f"    {module:5s} collisionEnabled: {before} -> True")
 
-    # [4] 자기충돌 OFF ---------------------------------------------------------
+    # [4] 자기충돌 ON + 바퀴 충돌 필터 -----------------------------------------
+    # 팔이 몸통을 통과하지 않도록 자기충돌을 켜되, 되살린 휠 콜라이더가 자기 하우징/
+    # 섀시와 겹쳐 로봇을 발사시키므로 6개 휠 링크를 모든 몸체 링크에 대해 필터링한다
+    # (휠은 바닥만 충돌). 측정: 필터 없이 ON -> z=700 m 발사 / 필터 후 -> root_z 1.405 안정.
     articulation = stage.GetPrimAtPath(ROBOT)
     attr = articulation.GetAttribute("physxArticulation:enabledSelfCollisions")
     if not attr:
         info("[X] enabledSelfCollisions 속성 없음")
         return 1
-    attr.Set(False)
-    changes.append("자기충돌 OFF")
-    info("\n[4] enabledSelfCollisions -> False")
-    info("    (켜면 휠 콜라이더가 하우징과 겹쳐 로봇이 z=700 m 로 발사됨)")
+    attr.Set(True)
+    changes.append("자기충돌 ON")
+    info("\n[4] enabledSelfCollisions -> True (+ 휠 충돌 필터)")
+
+    wheel_link_paths = [
+        f"{ROBOT}/{module}_wheel_{kind}_link"
+        for module in MODULES for kind in ("steer", "drive")
+    ]
+    body_link_paths = [
+        str(p.GetPath())
+        for p in Usd.PrimRange(articulation)
+        if p.HasAPI(UsdPhysics.RigidBodyAPI)
+    ]
+    pair_count = 0
+    for wheel_path in wheel_link_paths:
+        wheel_prim = stage.GetPrimAtPath(wheel_path)
+        if not wheel_prim.IsValid():
+            info(f"[X] 휠 링크 없음: {wheel_path}")
+            return 1
+        rel = UsdPhysics.FilteredPairsAPI.Apply(wheel_prim).CreateFilteredPairsRel()
+        for body_path in body_link_paths:
+            if body_path != wheel_path:
+                rel.AddTarget(body_path)
+                pair_count += 1
+    changes.append(f"휠 충돌 필터 {pair_count}쌍")
+    info(f"    휠 {len(wheel_link_paths)}개 x 몸체 {len(body_link_paths)}개 = {pair_count} 필터쌍")
 
     # [5] 휠 접지 재질 ---------------------------------------------------------
     info("\n[5] 휠 물리 재질 + 바인딩")
@@ -166,8 +191,9 @@ def main() -> int:
     stage.GetRootLayer().documentation = (
         "FFW_SG2 drivable variant. References FFW_SG2.usd and overrides only what the stock "
         "asset locks down for stationary manipulation: the world FixedJoint, the +/-1080 deg "
-        "wheel stops, the disabled left/right wheel colliders, and self-collision. "
-        "Self-collision must stay off: the wheel meshes overlap their housings. "
+        "wheel stops, the disabled left/right wheel colliders. Self-collision is enabled (so "
+        "the arms cannot pass through the torso) with the six wheel links filtered against all "
+        "body links, so the wheels collide only with the ground. "
         "Regenerate with scripts/tools/build_ffw_sg2_mobile_usd.py"
     )
     stage.Save()

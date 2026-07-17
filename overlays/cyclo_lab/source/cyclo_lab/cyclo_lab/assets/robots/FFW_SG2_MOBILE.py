@@ -51,13 +51,13 @@ FFW_SG2_MOBILE_CFG: ArticulationCfg = FFW_SG2_CFG.replace(
             disable_gravity=False,
             max_depenetration_velocity=5.0,
         ),
-        # KNOWN LIMITATION: self-collision must stay off. The wheel collision meshes the
-        # override layer re-enables overlap their own housings on frame 1, and PhysX answers
-        # that penetration by launching the robot to z=700 m. Filtering the wheel<->housing
-        # and wheel<->chassis pairs was measured to be insufficient. Cost of leaving it off:
-        # the arms can pass through the torso.
+        # Self-collision is ON (arms cannot pass through the torso). The override USD keeps
+        # it stable by filtering the six wheel links against every body link, so the
+        # re-enabled wheel colliders touch only the ground, not their own housings/chassis.
+        # Measured: without that filter, self-collision launches the robot to z=700 m;
+        # with it, the robot settles at root_z 1.405.
         articulation_props=ArticulationRootPropertiesCfg(
-            enabled_self_collisions=False,
+            enabled_self_collisions=True,
             solver_position_iteration_count=32,
             solver_velocity_iteration_count=1,
             fix_root_link=False,

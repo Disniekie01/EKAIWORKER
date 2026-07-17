@@ -367,6 +367,11 @@ class VRTrajectoryPublisher(Node):
         self.linear_x_scale = 5.0
         self.linear_y_scale = 5.0
         self.angular_z_scale = 3.0
+        # Base rotation is driven by the right controller's A / B buttons instead of the
+        # right thumbstick: A = turn right (angular.z < 0), B = turn left (angular.z > 0).
+        # Held = continuous turn at this rate (rad/s). The right thumbstick still works as a
+        # fallback when neither button is pressed.
+        self.button_turn_rate = 0.8
         # Match joystick_controller parameters
         self.left_jog_scale = 0.06
         self.right_jog_scale = 0.005
@@ -1058,6 +1063,18 @@ class VRTrajectoryPublisher(Node):
             left_y_deadzone = self.apply_deadzone(float(left_thumbstick_value[1]))
             right_y_deadzone = self.apply_deadzone(float(right_thumbstick_value[1]))
 
+            # Base rotation from the right controller's A / B buttons (held = continuous).
+            # A -> turn right (angular.z < 0), B -> turn left (angular.z > 0). Falls back to
+            # the right thumbstick when neither button is pressed.
+            rc = self.right_controller_state if isinstance(self.right_controller_state, dict) else {}
+            a_pressed = bool(rc.get('aButton', False))
+            b_pressed = bool(rc.get('bButton', False))
+            button_angular = 0.0
+            if a_pressed:
+                button_angular -= self.button_turn_rate
+            if b_pressed:
+                button_angular += self.button_turn_rate
+
             twist_msg = Twist()
             # Apply requested sign convention for SG2 base linear axes.
             twist_msg.linear.x = -left_x_deadzone / self.linear_x_scale
@@ -1065,7 +1082,10 @@ class VRTrajectoryPublisher(Node):
             twist_msg.linear.z = 0.0
             twist_msg.angular.x = 0.0
             twist_msg.angular.y = 0.0
-            twist_msg.angular.z = -right_y_deadzone / self.angular_z_scale
+            twist_msg.angular.z = (
+                button_angular if button_angular != 0.0
+                else -right_y_deadzone / self.angular_z_scale
+            )
 
             cmd_tuple = (twist_msg.linear.x, twist_msg.linear.y, twist_msg.angular.z)
             is_same_command = (
