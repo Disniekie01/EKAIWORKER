@@ -16,9 +16,12 @@ import isaaclab.sim as sim_utils
 from isaaclab.envs import mdp as isaac_mdp
 from isaaclab.managers import EventTermCfg as EventTerm
 from isaaclab.managers import SceneEntityCfg
+from isaaclab.managers import ObservationTermCfg as ObsTerm
 from isaaclab.sensors import FrameTransformerCfg, CameraCfg
 from isaaclab.sensors.frame_transformer.frame_transformer_cfg import OffsetCfg
 from isaaclab.utils import configclass
+
+from . import mdp
 
 from cyclo_lab.real_world_tasks.manager_based.FFW_SG2.pick_place.mdp import ffw_sg2_pick_place_events
 from cyclo_lab.real_world_tasks.manager_based.FFW_SG2.pick_place_l_table.mdp import ffw_sg2_l_table_events
@@ -264,3 +267,9 @@ class FFWSG2PickPlaceLTableMobileEnvCfg(FFWSG2PickPlaceLTableEnvCfg):
         # Free base driving from cmd_vel; disable the scripted L-motion / auto-L teleport.
         self.teleop_base_drive = True
         self.teleop_auto_l_on_grip_s = 0.0
+
+        # Record base velocity so state/action reach 22 dims (real ffw_sg2_rev1 parity):
+        # 19 joints + [linear_x, linear_y, angular_z]. Stored as obs/base_velocity; the
+        # LeRobot converter appends it. Only added on this mobile task -> the stock task
+        # stays 19-dim.
+        self.observations.policy.base_velocity = ObsTerm(func=mdp.base_planar_velocity)

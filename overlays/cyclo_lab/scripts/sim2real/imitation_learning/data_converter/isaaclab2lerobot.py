@@ -104,23 +104,40 @@ def detect_cameras(demo_group: h5py.Group) -> list[dict]:
     return cameras
 
 
-def get_env_features(fps: int, robot_type: str, cameras: list[dict]):
+# Drivable-base tasks record obs/base_velocity = [linear_x, linear_y, angular_z] (base frame),
+# appended to the 19 joints so state/action reach 22 dims (real ffw_sg2_rev1 parity).
+BASE_VELOCITY_KEY = "base_velocity"
+BASE_VELOCITY_NAMES = ["linear_x", "linear_y", "angular_z"]
+
+
+def detect_base_velocity(demo_group: h5py.Group) -> bool:
+    """True when the recording carries a base-velocity stream (mobile task)."""
+    return BASE_VELOCITY_KEY in demo_group["obs"]
+
+
+def get_env_features(fps: int, robot_type: str, cameras: list[dict], has_base_velocity: bool = False):
     if robot_type not in ROBOT_CONFIGS:
         raise ValueError(f"Unsupported robot type: {robot_type}")
 
     config = ROBOT_CONFIGS[robot_type]
 
+    # 19 joints, or 22 when the base velocity is appended (mobile task).
+    joint_names = list(config["joint_names"])
+    if has_base_velocity:
+        joint_names = joint_names + BASE_VELOCITY_NAMES
+    state_dim = len(joint_names)
+
     # Build action and observation.state features
     features = {
         "action": {
             "dtype": "float32",
-            "shape": (config["expected_dim"],),
-            "names": config["joint_names"],
+            "shape": (state_dim,),
+            "names": joint_names,
         },
         "observation.state": {
             "dtype": "float32",
-            "shape": (config["expected_dim"],),
-            "names": config["joint_names"],
+            "shape": (state_dim,),
+            "names": joint_names,
         }
     }
 
@@ -146,7 +163,7 @@ def get_env_features(fps: int, robot_type: str, cameras: list[dict]):
 
     return features
 
-def process_data(dataset: LeRobotDataset, task: str, demo_group: h5py.Group, demo_name: str, frame_skip: int, robot_type: str, cameras: list[dict]) -> bool:
+def process_data(dataset: LeRobotDataset, task: str, demo_group: h5py.Group, demo_name: str, frame_skip: int, robot_type: str, cameras: list[dict], has_base_velocity: bool = False) -> bool:
     """
     Process a single demonstration group from the HDF5 dataset
     and add it into the LeRobot dataset.
@@ -160,6 +177,11 @@ def process_data(dataset: LeRobotDataset, task: str, demo_group: h5py.Group, dem
         # Load action and joint position data
         actions = np.array(demo_group['actions'], dtype=np.float32)
         joint_pos = np.array(demo_group['obs/joint_pos'], dtype=np.float32)
+
+        # Base velocity [linear_x, linear_y, angular_z] for 22-dim mobile recordings.
+        base_velocity = None
+        if has_base_velocity:
+            base_velocity = np.array(demo_group[f"obs/{BASE_VELOCITY_KEY}"], dtype=np.float32)
 
         # Load camera images (recorded HWC uint8).
         camera_data = {}
@@ -200,10 +222,19 @@ def process_data(dataset: LeRobotDataset, task: str, demo_group: h5py.Group, dem
         if frame_index < frame_skip:
             continue
         
+        action_row = actions[frame_index]
+        state_row = joint_pos[frame_index]
+        if base_velocity is not None:
+            # Append base velocity to both. state gets the measured base twist; action reuses
+            # it as the base command (the swerve tracks cmd_vel closely, so measured ~= command).
+            base_row = base_velocity[frame_index]
+            action_row = np.concatenate([action_row, base_row])
+            state_row = np.concatenate([state_row, base_row])
+
         # Build frame dictionary
         frame = {
-            "action": actions[frame_index],
-            "observation.state": joint_pos[frame_index],
+            "action": action_row,
+            "observation.state": state_row,
         }
 
         # Add camera images, HWC -> CHW to match the real ffw_sg2_rev1 layout.
@@ -225,24 +256,26 @@ def convert_isaaclab_to_lerobot(
     hdf5_files = [dataset_file]
     now_episode_index = 0
 
-    # Detect which camera streams this recording actually contains, from its first demo.
+    # Detect which streams this recording actually contains, from its first demo.
     # The feature schema must be fixed before the dataset is created, so this happens first.
     with h5py.File(dataset_file, "r") as f:
         first_demo = f["data"][list(f["data"].keys())[0]]
         cameras = detect_cameras(first_demo)
+        has_base_velocity = detect_base_velocity(first_demo)
     if cameras:
         print("Detected cameras: " + ", ".join(
             f"{c['hdf5_key']} -> observation.images.rgb.{c['lerobot_name']} "
             f"[{c['height']}x{c['width']}]" for c in cameras))
     else:
         print("WARNING: no known camera streams found in HDF5 (state/action only).")
+    print(f"Base velocity: {'present -> 22-dim state/action' if has_base_velocity else 'absent -> 19-dim'}")
 
     # Create a new LeRobot dataset
     dataset = LeRobotDataset.create(
         repo_id=repo_id,
         fps=fps,
         robot_type=robot_type,
-        features=get_env_features(fps, robot_type, cameras),
+        features=get_env_features(fps, robot_type, cameras, has_base_velocity),
         root=root,
     )
 
@@ -261,7 +294,7 @@ def convert_isaaclab_to_lerobot(
                     print(f"Demo {demo_name} not successful, skipping...")
                     continue
 
-                valid = process_data(dataset, task, demo_group, demo_name, frame_skip, robot_type, cameras)
+                valid = process_data(dataset, task, demo_group, demo_name, frame_skip, robot_type, cameras, has_base_velocity)
 
                 if valid:
                     now_episode_index += 1
