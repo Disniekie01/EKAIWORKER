@@ -42,6 +42,12 @@ from cyclo_lab.assets.robots.FFW_SG2 import FFW_SG2_CFG
 # all that is needed for the robot to settle onto its wheels.
 SG2_MOBILE_SPAWN_HEIGHT = 0.01
 
+# Base-body world z where the wheels just clear the ground. Spawn places the base at
+# SPAWN_HEIGHT + ~1.43 (USD offset) = ~1.44, but reset_scene_to_default writes the raw
+# init pos (~0.01) straight to the base body and buries the wheels. The mobile task's
+# reset_mobile_base_standing event teleports the base back to this height after each reset.
+SG2_MOBILE_STANDING_Z = 1.44
+
 FFW_SG2_MOBILE_CFG: ArticulationCfg = FFW_SG2_CFG.replace(
     spawn=FFW_SG2_CFG.spawn.replace(
         # Override layer over FFW_SG2.usd: floating base, free drive joints, live wheel

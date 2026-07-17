@@ -29,7 +29,7 @@ from cyclo_lab.real_world_tasks.manager_based.FFW_SG2.pick_place_l_table.pick_pl
 
 from isaaclab.markers.config import FRAME_MARKER_CFG  # isort: skip
 from cyclo_lab.assets.robots.FFW_SG2 import FFW_SG2_CFG  # isort: skip
-from cyclo_lab.assets.robots.FFW_SG2_MOBILE import FFW_SG2_MOBILE_CFG  # isort: skip
+from cyclo_lab.assets.robots.FFW_SG2_MOBILE import FFW_SG2_MOBILE_CFG, SG2_MOBILE_STANDING_Z  # isort: skip
 from cyclo_lab.assets.object.table_prim import TABLE_FRONT_CFG, TABLE_LEFT_CFG
 from cyclo_lab.assets.object.cardboard_box import CARDBOARD_BOX_CFG
 from cyclo_lab.assets.object.box_riser import BOX_RISER_CFG
@@ -267,6 +267,14 @@ class FFWSG2PickPlaceLTableMobileEnvCfg(FFWSG2PickPlaceLTableEnvCfg):
         # Free base driving from cmd_vel; disable the scripted L-motion / auto-L teleport.
         self.teleop_base_drive = True
         self.teleop_auto_l_on_grip_s = 0.0
+
+        # reset_scene_to_default buries the free base (writes the ~0.01 init z straight to the
+        # base body, ignoring the USD's ~1.43 m offset). Lift it back to standing after reset.
+        self.events.reset_mobile_base = EventTerm(
+            func=ffw_sg2_l_table_events.reset_mobile_base_standing,
+            mode="reset",
+            params={"height": SG2_MOBILE_STANDING_Z, "asset_cfg": SceneEntityCfg("robot")},
+        )
 
         # Record base velocity so state/action reach 22 dims (real ffw_sg2_rev1 parity):
         # 19 joints + [linear_x, linear_y, angular_z]. Stored as obs/base_velocity; the
