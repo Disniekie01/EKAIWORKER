@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import subprocess
 import threading
 import time
@@ -67,6 +68,16 @@ TASKS: dict[str, dict[str, str]] = {
         "id": "Cyclo-Real-Pick-Place-LTable-FFW-SG2-v0",
         "mimic_id": "Cyclo-Real-Mimic-Pick-Place-LTable-FFW-SG2-v0",
         "dataset": "ffw_sg2_l_table_raw.hdf5",
+        "robot": "FFW_SG2",
+    },
+    # Plan B: drivable base. Operator drives the swerve base from the VR joystick
+    # (thumbstick = translate, A/B = rotate) instead of the scripted L-motion; base
+    # velocity is recorded (22-dim). Recording only for now -- the mimic/datagen path
+    # is not yet wired for the mobile 22-dim data.
+    "L-Table Pick & Place (mobile base)": {
+        "id": "Cyclo-Real-Pick-Place-LTable-Mobile-FFW-SG2-v0",
+        "mimic_id": "Cyclo-Real-Mimic-Pick-Place-LTable-FFW-SG2-v0",
+        "dataset": "ffw_sg2_l_table_mobile_raw.hdf5",
         "robot": "FFW_SG2",
     },
     "Box Stack (thick box)": {
@@ -454,12 +465,27 @@ def launch_recorder(*, ensure_teleop: bool = True) -> tuple[bool, str]:
         if not teleop.get("vr", {}).get("ok") or not teleop.get("ai", {}).get("ok"):
             _log("recorder", "aborted: teleop stack failed to start for selected robot")
             return False, "teleop stack failed; see vr/ai logs"
-    ds = f"{REPO_IN}/datasets/{task['dataset']}"
+    global _active_session
+    if USE_SESSION_NAMING:
+        _active_session = {
+            "date": time.strftime("%Y%m%d"),
+            "time": time.strftime("%H%M"),
+            "ip": _ip_suffix(),
+            "src": _teleop_source(),
+        }
+        ds = _session_file(task, _active_session, "raw")
+        mkdir = f"mkdir -p {_session_dir(task, _active_session)} && "
+        _log("recorder",
+             f"session {_active_session['date']}/{_active_session['time']}"
+             f"-{_active_session['ip']}-{_active_session['src']} -> {ds}")
+    else:
+        ds = f"{REPO_IN}/datasets/{task['dataset']}"
+        mkdir = ""
     auto_flag = " --auto_success" if _auto_success else ""
     _log("recorder", f"task: {task['label']} -> {task['id']} ({profile['robot_type']})")
     _log("recorder", f"save mode: {'auto success' if _auto_success else 'manual'}")
     cmd = (
-        f"cd {REPO_IN} && export DISPLAY=:1 && {ENV_ROS} && "
+        f"cd {REPO_IN} && {mkdir}export DISPLAY=:1 && {ENV_ROS} && "
         f"{ISAAC_PY} scripts/sim2real/imitation_learning/recorder/record_demos.py "
         f"--task={task['id']} --robot_type {profile['robot_type']} "
         f"--dataset_file {ds} --num_demos {NUM_DEMOS}{auto_flag} --enable_cameras"
@@ -512,8 +538,114 @@ def launch_record() -> dict:
     return out
 
 
+# ============================================================================
+# Session-based dataset naming
+# ----------------------------------------------------------------------------
+# New layout:
+#   folder: datasets/{base}/{YYYYMMDD}/
+#   file:   {HHMM}_{ip}_{src}_{base}_{stage}.hdf5
+#           ip   = last octet of host IPv4 (concurrent-user disambiguation)
+#           src  = teleop source: 'vr' or 'leader' (auto / env TELEOP_SOURCE)
+#           base = e.g. ffw_sg2_l_table
+#
+# SAFETY: set USE_SESSION_NAMING = False to instantly revert to the original
+# flat naming (datasets/<base>_raw.hdf5, _ik.hdf5, ...). A full backup of the
+# pre-change file is at sg2_ltable_dashboard.py.bak
+# ============================================================================
+USE_SESSION_NAMING = True
+
+# filename stage token: {HHMM}_{base}_{token}.hdf5  (internal key -> file token)
+_STAGE_FILE_TOKEN = {
+    "raw": "raw", "ik": "ik", "annotate": "annotate",
+    "generate": "gen", "joint": "joint",
+}
+
+# Active recording session, set when a recorder is launched:
+#   {"date": "YYYYMMDD", "time": "HHMM"}
+_active_session: dict[str, str] | None = None
+
+
+def _ip_suffix() -> str:
+    """Last octet of this host's primary IPv4 — disambiguates concurrent users."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))  # no packet sent; just selects the interface
+            ip = s.getsockname()[0]
+        finally:
+            s.close()
+        return ip.rsplit(".", 1)[-1]
+    except Exception:
+        return "0"
+
+
+def _teleop_source() -> str:
+    """Teleop source token for filenames: 'vr' or 'leader'.
+
+    Auto-detects: 'vr' if a VR teleop model is running, else 'leader'
+    (real-robot Leader device). Override with env TELEOP_SOURCE=vr|leader.
+    """
+    override = os.environ.get("TELEOP_SOURCE")
+    if override in ("vr", "leader"):
+        return override
+    try:
+        return "vr" if _running_vr_model() else "leader"
+    except Exception:
+        return "vr"
+
+
+def _task_base(task: dict[str, str]) -> str:
+    """Base id like 'ffw_sg2_l_table' derived from the task raw dataset name."""
+    raw = task["dataset"]
+    if raw.endswith("_raw.hdf5"):
+        return raw[: -len("_raw.hdf5")]
+    return raw.removesuffix(".hdf5")
+
+
+def _session_dir(task: dict[str, str], session: dict[str, str]) -> str:
+    return f"{REPO_IN}/datasets/{_task_base(task)}/{session['date']}"
+
+
+def _session_file(task: dict[str, str], session: dict[str, str], stage: str) -> str:
+    base = _task_base(task)
+    return (f"{_session_dir(task, session)}/"
+            f"{session['time']}_{session['ip']}_{session['src']}_{base}_{_STAGE_FILE_TOKEN[stage]}.hdf5")
+
+
+def _latest_session(task: dict[str, str]) -> dict[str, str] | None:
+    """Fallback: find the newest recorded session (newest date folder + newest raw)."""
+    base = _task_base(task)
+    root = f"{REPO_IN}/datasets/{base}"
+    _, day = _run(["docker", "exec", CYCLO_C, "bash", "-lc",
+                   f"ls -1 {root} 2>/dev/null | sort -r | head -1 | tr -d '\\n'"])
+    day = (day or "").strip()
+    if not day:
+        return None
+    _, fname = _run(["docker", "exec", CYCLO_C, "bash", "-lc",
+                     f"ls -1 {root}/{day}/*_{base}_raw.hdf5 2>/dev/null | xargs -n1 basename 2>/dev/null "
+                     f"| sort -r | head -1 | tr -d '\\n'"])
+    fname = (fname or "").strip()
+    if not fname:
+        return None
+    parts = fname.split("_")  # {time}_{ip}_{src}_{base...}_{stage}.hdf5
+    return {
+        "date": day,
+        "time": parts[0],
+        "ip": parts[1] if len(parts) > 3 else "0",
+        "src": parts[2] if len(parts) > 3 else "vr",
+    }
+
+
 def _pipeline_paths(task: dict[str, str]) -> dict[str, str]:
-    """Derive mimic-pipeline HDF5 paths from the task raw dataset name."""
+    """Derive mimic-pipeline HDF5 paths for the current session (or legacy flat)."""
+    if USE_SESSION_NAMING:
+        session = _active_session or _latest_session(task)
+        if session is not None:
+            return {stage: _session_file(task, session, stage)
+                    for stage in ("raw", "ik", "annotate", "generate", "joint")}
+        _log("pipeline", "no recorded session found; falling back to legacy flat naming")
+
+    # --- legacy flat naming (original behavior) ---
     raw_name = task["dataset"]
     if raw_name.endswith("_raw.hdf5"):
         base = raw_name[: -len("_raw.hdf5")]
