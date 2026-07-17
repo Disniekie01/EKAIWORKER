@@ -188,6 +188,28 @@ def main() -> int:
     info(f"    static={WHEEL_STATIC_FRICTION} dynamic={WHEEL_DYNAMIC_FRICTION}"
          f" -> 휠 {len(wheel_colliders)}개")
 
+    # [6] 바디별 중력 ---------------------------------------------------------
+    # 베이스 + 바퀴만 중력 ON (바퀴 접지력 = 주행에 필요). 팔/리프트/헤드/그리퍼는
+    # 중력 OFF -> 스톡 로봇처럼 처지지 않고 액추에이터 명령(썸스틱 리프트 등)대로 유지된다.
+    # 스톡 로봇은 전체 중력 OFF였음.
+    info("\n[6] 바디별 중력 (베이스+바퀴만 ON, 상체 OFF)")
+    gravity_on_links = {"world"} | {
+        f"{module}_wheel_{kind}_link" for module in MODULES for kind in ("steer", "drive")
+    }
+    on_count = off_count = 0
+    for prim in Usd.PrimRange(articulation):
+        if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            continue
+        disable = prim.GetName() not in gravity_on_links
+        attr = prim.GetAttribute("physxRigidBody:disableGravity") or prim.CreateAttribute(
+            "physxRigidBody:disableGravity", Sdf.ValueTypeNames.Bool
+        )
+        attr.Set(disable)
+        off_count += int(disable)
+        on_count += int(not disable)
+    changes.append(f"중력 ON {on_count}개 / OFF {off_count}개")
+    info(f"    중력 ON: {on_count}개 (베이스+바퀴)  OFF: {off_count}개 (상체)")
+
     stage.GetRootLayer().documentation = (
         "FFW_SG2 drivable variant. References FFW_SG2.usd and overrides only what the stock "
         "asset locks down for stationary manipulation: the world FixedJoint, the +/-1080 deg "

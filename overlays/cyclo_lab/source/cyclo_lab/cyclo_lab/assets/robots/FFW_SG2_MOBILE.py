@@ -54,7 +54,9 @@ FFW_SG2_MOBILE_CFG: ArticulationCfg = FFW_SG2_CFG.replace(
         # colliders, wheel contact material. Keeps the stock gripper-friction spawn hook.
         usd_path=f"{CYCLO_LAB_ASSETS_DATA_DIR}/robots/FFW/FFW_SG2_MOBILE.usd",
         rigid_props=RigidBodyPropertiesCfg(
-            disable_gravity=False,
+            # None = keep the USD's per-body gravity: base + wheels ON (traction), upper
+            # body OFF (arms/lift don't sag, matching the stock gravity-off robot).
+            disable_gravity=None,
             max_depenetration_velocity=5.0,
         ),
         # Self-collision is ON (arms cannot pass through the torso). The override USD keeps
