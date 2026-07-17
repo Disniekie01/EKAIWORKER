@@ -364,6 +364,9 @@ class VRTrajectoryPublisher(Node):
         self.joystick_mode = True
         self.prev_left_thumbstick_pressed = False
         self.prev_right_thumbstick_pressed = False
+        # Left Y button (= left controller bButton) toggles LIFT+HEAD <-> LIFT+CMD_VEL.
+        # More reliable than the both-thumbstick click, which is easy to mis-trigger.
+        self.prev_mode_button_pressed = False
         self.linear_x_scale = 5.0
         self.linear_y_scale = 5.0
         self.angular_z_scale = 3.0
@@ -942,6 +945,21 @@ class VRTrajectoryPublisher(Node):
 
             self.prev_left_thumbstick_pressed = left_thumbstick_pressed
             self.prev_right_thumbstick_pressed = right_thumbstick_pressed
+
+            # Toggle mode on the left Y button (bButton) rising edge -- a dedicated,
+            # reliable control instead of the finicky both-thumbstick click.
+            mode_button = (
+                bool(self.left_controller_state.get('bButton', False))
+                if isinstance(self.left_controller_state, dict) else False
+            )
+            if mode_button and not self.prev_mode_button_pressed:
+                self.joystick_mode = not self.joystick_mode
+                mode_name = 'LIFT+HEAD' if self.joystick_mode else 'LIFT+CMD_VEL'
+                self.get_logger().info(f'[Y-BUTTON] Mode switched to: {mode_name}')
+                if self.joystick_mode:
+                    # Stop the base when leaving cmd_vel mode.
+                    self.publish_cmd_vel_from_thumbstick([0.0, 0.0], [0.0, 0.0])
+            self.prev_mode_button_pressed = mode_button
 
             # Lift always follows right Y axis.
             # Match joystick_controller: lift uses right X axis.
