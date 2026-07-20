@@ -966,12 +966,13 @@ class VRTrajectoryPublisher(Node):
             if abs(right_thumbstick_value[0]) > 0.0:
                 self.publish_right_joystick(right_thumbstick_value[0])
 
-            # Left stick controls head in joystick_mode, otherwise base cmd_vel.
+            # Head mode: left stick drives the head. Base cmd_vel is published every cycle so
+            # A/B rotation works in both modes; thumbstick translation is gated to cmd_vel mode
+            # inside publish_cmd_vel_from_thumbstick.
             if self.joystick_mode:
                 if abs(left_thumbstick_value[0]) > 0.0 or abs(left_thumbstick_value[1]) > 0.0:
                     self.publish_left_joystick_from_thumbstick(left_thumbstick_value)
-            else:
-                self.publish_cmd_vel_from_thumbstick(left_thumbstick_value, right_thumbstick_value)
+            self.publish_cmd_vel_from_thumbstick(left_thumbstick_value, right_thumbstick_value)
 
         except Exception as e:
             self.get_logger().error(f'Error processing thumbstick: {e}')
@@ -1077,9 +1078,15 @@ class VRTrajectoryPublisher(Node):
             if not self.vr_publishing_enabled:
                 return
 
-            left_x_deadzone = self.apply_deadzone(float(left_thumbstick_value[0]))
-            left_y_deadzone = self.apply_deadzone(float(left_thumbstick_value[1]))
-            right_y_deadzone = self.apply_deadzone(float(right_thumbstick_value[1]))
+            # Thumbstick translation only applies in cmd_vel mode; in head mode the left stick
+            # drives the head. A/B rotation (below) applies in BOTH modes so the operator can
+            # always turn the base without hunting for the right mode.
+            if not self.joystick_mode:  # LIFT+CMD_VEL
+                left_x_deadzone = self.apply_deadzone(float(left_thumbstick_value[0]))
+                left_y_deadzone = self.apply_deadzone(float(left_thumbstick_value[1]))
+                right_y_deadzone = self.apply_deadzone(float(right_thumbstick_value[1]))
+            else:
+                left_x_deadzone = left_y_deadzone = right_y_deadzone = 0.0
 
             # Base rotation from the right controller's A / B buttons (held = continuous).
             # A -> turn right (angular.z < 0), B -> turn left (angular.z > 0). Falls back to
