@@ -202,10 +202,17 @@ def process_data(dataset: LeRobotDataset, task: str, demo_group: h5py.Group, dem
     if joint_pos.ndim == 1:
         joint_pos = joint_pos.reshape(-1, config["expected_dim"])
     
-    if actions.shape[1] != config["expected_dim"]:
+    # Mobile datagen may hand us pre-packed actions ([joints(19) | base velocity(3)] = 22).
+    # Accept either the plain joint dim (base appended below) or the pre-packed dim.
+    packed_dim = config["expected_dim"] + len(BASE_VELOCITY_NAMES)
+    action_prepacked = base_velocity is not None and actions.shape[1] == packed_dim
+    valid_action_dims = {config["expected_dim"]}
+    if base_velocity is not None:
+        valid_action_dims.add(packed_dim)
+    if actions.shape[1] not in valid_action_dims:
         print(
             f"Demo {demo_name} action dim {actions.shape[1]} != "
-            f"expected {config['expected_dim']} for {robot_type}, skipping..."
+            f"expected {sorted(valid_action_dims)} for {robot_type}, skipping..."
         )
         return False
     if joint_pos.shape[1] != config["expected_dim"]:
@@ -225,11 +232,12 @@ def process_data(dataset: LeRobotDataset, task: str, demo_group: h5py.Group, dem
         action_row = actions[frame_index]
         state_row = joint_pos[frame_index]
         if base_velocity is not None:
-            # Append base velocity to both. state gets the measured base twist; action reuses
-            # it as the base command (the swerve tracks cmd_vel closely, so measured ~= command).
+            # state is built from the 19-dim joint_pos, so always append the measured base twist.
+            # action: append only when not already packed upstream (mobile datagen packs it in).
             base_row = base_velocity[frame_index]
-            action_row = np.concatenate([action_row, base_row])
             state_row = np.concatenate([state_row, base_row])
+            if not action_prepacked:
+                action_row = np.concatenate([action_row, base_row])
 
         # Build frame dictionary
         frame = {

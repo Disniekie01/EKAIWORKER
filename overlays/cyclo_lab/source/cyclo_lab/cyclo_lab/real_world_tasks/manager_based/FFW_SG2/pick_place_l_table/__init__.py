@@ -57,3 +57,14 @@ gym.register(
     },
     disable_env_checker=True,
 )
+
+# Plan B: mimic datagen for the drivable-base task. Generated demos keep base velocity so the
+# LeRobot export is 22-dim (mobile) instead of 19-dim (stock). Same mimic env class.
+gym.register(
+    id="Cyclo-Real-Mimic-Pick-Place-LTable-Mobile-FFW-SG2-v0",
+    entry_point=_MIMIC_ENTRY,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.pick_place_l_table_mimic_env_cfg:FFWSG2PickPlaceLTableMobileMimicEnvCfg",
+    },
+    disable_env_checker=True,
+)
