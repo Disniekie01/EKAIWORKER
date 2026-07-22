@@ -72,11 +72,11 @@ TASKS: dict[str, dict[str, str]] = {
     },
     # Plan B: drivable base. Operator drives the swerve base from the VR joystick
     # (thumbstick = translate, A/B = rotate) instead of the scripted L-motion; base
-    # velocity is recorded (22-dim). Recording only for now -- the mimic/datagen path
-    # is not yet wired for the mobile 22-dim data.
+    # velocity is recorded (22-dim). The mimic/datagen path uses the mobile mimic task,
+    # which drives the base physically and keeps all stages at 22-dim.
     "L-Table Pick & Place (mobile base)": {
         "id": "Cyclo-Real-Pick-Place-LTable-Mobile-FFW-SG2-v0",
-        "mimic_id": "Cyclo-Real-Mimic-Pick-Place-LTable-FFW-SG2-v0",
+        "mimic_id": "Cyclo-Real-Mimic-Pick-Place-LTable-Mobile-FFW-SG2-v0",
         "dataset": "ffw_sg2_l_table_mobile_raw.hdf5",
         "robot": "FFW_SG2",
     },
