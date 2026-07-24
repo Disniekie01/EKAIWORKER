@@ -42,8 +42,14 @@ _SCRIPT_LIFT_MIN_STD = 1e-3
 
 
 def body_joint_cmds_from_actions(actions: torch.Tensor) -> torch.Tensor:
-    """Return per-step [lift, head1, head2] from recorded actions (record replay layout)."""
-    return actions[:, _ACT_BODY].clone()
+    """Return per-step [lift, head1, head2] from recorded actions (record replay layout).
+
+    Recorded SG2 actions store [head1, head2, lift] at 16:19 -- head and lift are
+    swapped relative to the env action layout (same swap as --remap_ffw_sg2_actions).
+    """
+    lift = actions[:, 18:19]
+    head = actions[:, 16:18]
+    return torch.cat([lift, head], dim=1).clone()
 
 
 def body_joint_cmds_from_joint_pos(joint_pos: torch.Tensor) -> torch.Tensor:
@@ -121,6 +127,16 @@ class CycloDataGenInfoPool(DataGenInfoPool):
 
     def _add_episode(self, episode):
         super()._add_episode(episode)
+        # Retained source episodes are used only for state/action replay (L-motion,
+        # lift/head). Recorded camera images are never read by datagen (cameras are
+        # re-rendered during generation), so drop them here to avoid GPU OOM when many
+        # source demos are loaded. datagen_info / joint_pos obs are kept.
+        obs = episode.data.get("obs")
+        if isinstance(obs, dict):
+            for key in list(obs.keys()):
+                k = key.lower()
+                if "cam" in k or "image" in k or "rgb" in k:
+                    del obs[key]
         self.episodes.append(episode)
 
         if "actions" in episode.data:
@@ -423,6 +439,13 @@ async def cyclo_multi_waypoint_execute(
             env._mimic_recorded_state = (recorded_episode, recorded_state_index)
         if hasattr(env, "_mimic_carry_latch"):
             env._mimic_carry_latch = recorded_carry_latch
+        # Per-env slots for the multi-env datagen path (num_envs > 1).
+        if hasattr(env, "_mimic_recorded_states"):
+            env._mimic_recorded_states[env_id] = (recorded_episode, recorded_state_index)
+            if recorded_carry_latch:
+                env._mimic_carry_latch_envs.add(env_id)
+            else:
+                env._mimic_carry_latch_envs.discard(env_id)
 
     if "action_noise_dict" in inspect.signature(env.target_eef_pose_to_action).parameters:
         action_noise_dict = {eef_name: waypoint.noise for eef_name, waypoint in self.waypoints.items()}
