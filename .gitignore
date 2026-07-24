@@ -4,3 +4,11 @@ workspace/
 __pycache__/
 *.pyc
 .DS_Store
+
+# Upstream repos cloned by setup.sh + datasets (hundreds of GB) — never commit.
+# Only overlays/ is managed in this repo.
+/cyclo_lab/
+/ai_worker/
+/robotis_applications/
+datasets/
+*.hdf5
