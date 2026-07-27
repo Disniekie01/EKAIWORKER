@@ -118,20 +118,62 @@ def _state_to_device(state: dict, device: torch.device) -> dict:
     return output
 
 
-def _apply_recorded_step_state(env, episode: EpisodeData, state_index: int, env_ids: torch.Tensor | None) -> bool:
+def _apply_recorded_step_state(
+    env,
+    episode: EpisodeData,
+    state_index: int,
+    env_ids: torch.Tensor | None,
+    *,
+    skip_robot_joints: bool = False,
+) -> bool:
     """Apply a recorded post-step scene state (robot base, box, joints, etc.).
 
     VR L-table demos record kinematic L-motion outside the action vector. Replaying
     arm commands alone leaves the base at its spawn pose; restoring recorded states
     after each step keeps playback aligned with the teleop trajectory.
+
+    For ``mimic_ik`` replay set ``skip_robot_joints=True``: pin joints to the live DiffIK
+    pose (``InteractiveScene.reset_to`` always writes joints; dropping keys is invalid).
+    Restoring recorded joints snaps arms off the IK solution every frame (visible jitter).
     """
     step_state = episode.get_state(state_index)
     if step_state is None:
         return False
     step_state = _state_to_device(step_state, env.device)
+    if skip_robot_joints:
+        step_state = _with_live_robot_joints(env, step_state)
     env.scene.reset_to(step_state, env_ids=env_ids, is_relative=True)
     env.sim.forward()
     return True
+
+
+def _with_live_robot_joints(env, state: dict) -> dict:
+    """Pin robot joints to live values so scene.reset_to is a no-op on arms.
+
+    ``InteractiveScene.reset_to`` always writes joint_position/joint_velocity.
+    Dropping those keys raises KeyError / can hang. Instead overwrite them with
+    the current articulation joint state while still restoring root pose and
+    rigid objects (needed for L-table base / box replay).
+    """
+    artic = state.get("articulation")
+    if not isinstance(artic, dict) or "robot" not in artic:
+        return state
+    robot = artic["robot"]
+    if not isinstance(robot, dict):
+        return state
+    robot_asset = env.scene["robot"]
+    live_robot = {
+        **robot,
+        "joint_position": robot_asset.data.joint_pos.clone(),
+        "joint_velocity": robot_asset.data.joint_vel.clone(),
+    }
+    return {
+        **state,
+        "articulation": {
+            **artic,
+            "robot": live_robot,
+        },
+    }
 
 
 def compare_states(state_from_dataset, runtime_state, runtime_env_index) -> (bool, str):
@@ -287,7 +329,13 @@ def main():
                         if state_index < 0:
                             continue
                         env_ids = torch.tensor([env_id], dtype=torch.int64, device=env.device)
-                        _apply_recorded_step_state(env, episode_data, state_index, env_ids=env_ids)
+                        _apply_recorded_step_state(
+                            env,
+                            episode_data,
+                            state_index,
+                            env_ids=env_ids,
+                            skip_robot_joints=(args_cli.action_mode == "mimic_ik"),
+                        )
 
                 if state_validation_enabled:
                     state_from_dataset = env_episode_data_map[0].get_next_state()

@@ -105,12 +105,12 @@ _FFW_SG2_JOINT_ACTION_DIM = 19
 
 
 def remap_ffw_sg2_joint_actions_to_env(actions):
-    """Swap head/lift slots from joint_pos_target layout to ActionManager layout.
+    """Swap head/lift slots from observation layout to ActionManager layout.
 
-    Training HDF5 (joint convert) stores actions in observation order:
-      [..., head_joint1, lift_joint, head_joint2]
-    while ActionManager applies:
-      [..., lift_joint, head_joint1, head_joint2]
+    Observation / legacy joint-HDF5 order:
+      [..., head_joint1(16), lift_joint(17), head_joint2(18)]
+    ActionManager / fixed joint-convert order:
+      [..., lift_joint(16), head_joint1(17), head_joint2(18)]
     """
     if actions.shape[-1] != _FFW_SG2_JOINT_ACTION_DIM:
         return actions
@@ -118,6 +118,18 @@ def remap_ffw_sg2_joint_actions_to_env(actions):
     mapped[..., 16] = actions[..., 17]
     mapped[..., 17] = actions[..., 16]
     return mapped
+
+
+def actions_look_like_obs_head_lift_layout(actions) -> bool:
+    """Heuristic: obs layout has head1 @16 (higher mean) and lift @17 (lower mean)."""
+    import numpy as np
+
+    arr = np.asarray(actions)
+    if arr.ndim == 1:
+        arr = arr[None, :]
+    if arr.shape[-1] != _FFW_SG2_JOINT_ACTION_DIM:
+        return False
+    return float(arr[..., 16].mean()) > float(arr[..., 17].mean())
 
 
 def rollout(policy, env, success_term, horizon, device):
@@ -181,6 +193,7 @@ def rollout(policy, env, success_term, horizon, device):
         # Apply actions
         obs_dict, _, terminated, truncated, _ = env.step(actions)
         obs = obs_dict["policy"]
+
         if l_motion_ctrl is not None:
             env_ids = torch.arange(env.num_envs, device=env.device)
             l_motion_ctrl.step_interval(env_ids)
@@ -210,10 +223,19 @@ def main():
     elif args_cli.remap_ffw_sg2_actions:
         pass
     elif args_cli.task and "FFW-SG2" in args_cli.task:
+        # Legacy joint HDF5s / policies used observation order [head1, lift, head2].
+        # New action_data_converter joint exports use ActionManager order [lift, head1, head2]
+        # — pass --no_remap_ffw_sg2_actions for those.
         args_cli.remap_ffw_sg2_actions = True
+        print(
+            "[INFO] FFW-SG2: enabling head/lift action remap (obs→ActionManager). "
+            "Use --no_remap_ffw_sg2_actions if the policy was trained on a fixed "
+            "joint-convert export (lift@16, head@17/18)."
+        )
 
     # parse configuration
     env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1, use_fabric=not args_cli.disable_fabric)
+
     if hasattr(env_cfg, "init_action_cfg"):
         env_cfg.init_action_cfg(args_cli.action_mode)
 

@@ -122,9 +122,10 @@ class FFWSG2PickPlaceLTableEnvCfg(PickPlaceLTableEnvCfg):
     def __post_init__(self):
         super().__post_init__()
         self.events = EventCfg()
-
         self.scene.robot = FFW_SG2_CFG.replace(prim_path="{ENV_REGEX_NS}/Robot")
         self.scene.robot.spawn.semantic_tags = [("class", "robot")]
+        # Home pose + optional gripper PD from named cfg fields.
+        self.sync_configured_params()
 
         self.scene.table_front = TABLE_FRONT_CFG.replace(prim_path="{ENV_REGEX_NS}/TableFront")
         self.scene.table_left = TABLE_LEFT_CFG.replace(prim_path="{ENV_REGEX_NS}/TableLeft")
@@ -184,38 +185,34 @@ class FFWSG2PickPlaceLTableEnvCfg(PickPlaceLTableEnvCfg):
             ),
         )
 
-        _WRIST_SPAWN = sim_utils.PinholeCameraCfg(
-            focal_length=8.0,
-            focus_distance=200.0,
+        _wrist_cam_spawn = sim_utils.PinholeCameraCfg(
+            focal_length=5.0,
+            focus_distance=400.0,
             horizontal_aperture=20.955,
-            clipping_range=(0.01, 100.0),
+            clipping_range=(0.01, 2.0),
         )
-        # Portrait 424 x 240 to match the real wrist streams. Mounted at the RealSense D405
-        # pose measured from the USD (the ``arm_*_link7/visuals/d405`` prim): the real wrist
-        # camera location. Left and right share the same local transform.
-        #   pos  = (0.10683, 0.0, -0.07713)   relative to arm_*_link7
-        #   rot  = 180 deg about Y  ->  quat (w,x,y,z) = (0, 0, 1, 0)  (d405 body frame)
-        # convention="ros" applies the RealSense optical-frame convention on top of that body
-        # orientation. If the view still faces the wrong way, adjust rot/convention here.
-        _WRIST_POS = (0.10683, 0.0, -0.07713)
-        _WRIST_ROT = (0.0, 0.0, 1.0, 0.0)
-        self.scene.cam_left_wrist = CameraCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/ffw_sg2_follower/arm_l_link7/cam_left_wrist",
-            update_period=0.0,
-            height=424,
-            width=240,
-            data_types=["rgb"],
-            spawn=_WRIST_SPAWN.copy(),
-            offset=CameraCfg.OffsetCfg(pos=_WRIST_POS, rot=_WRIST_ROT, convention="ros"),
+        _wrist_cam_offset = CameraCfg.OffsetCfg(
+            pos=(0.2, 0.0, -0.1),
+            rot=(0.700971, -0.243221, 0.174238, -0.647398),
+            convention="opengl",
         )
-        self.scene.cam_right_wrist = CameraCfg(
-            prim_path="{ENV_REGEX_NS}/Robot/ffw_sg2_follower/arm_r_link7/cam_right_wrist",
+        self.scene.cam_wrist_left = CameraCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/ffw_sg2_follower/arm_l_link7/cam_wrist_left",
             update_period=0.0,
-            height=424,
-            width=240,
+            height=376,
+            width=672,
             data_types=["rgb"],
-            spawn=_WRIST_SPAWN.copy(),
-            offset=CameraCfg.OffsetCfg(pos=_WRIST_POS, rot=_WRIST_ROT, convention="ros"),
+            spawn=_wrist_cam_spawn,
+            offset=_wrist_cam_offset,
+        )
+        self.scene.cam_wrist_right = CameraCfg(
+            prim_path="{ENV_REGEX_NS}/Robot/ffw_sg2_follower/arm_r_link7/cam_wrist_right",
+            update_period=0.0,
+            height=376,
+            width=672,
+            data_types=["rgb"],
+            spawn=_wrist_cam_spawn,
+            offset=_wrist_cam_offset,
         )
 
         marker_cfg = FRAME_MARKER_CFG.copy()

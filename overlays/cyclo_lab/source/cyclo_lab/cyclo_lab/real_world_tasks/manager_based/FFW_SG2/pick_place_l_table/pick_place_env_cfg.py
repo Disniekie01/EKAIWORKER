@@ -13,6 +13,7 @@
 # limitations under the License.
 
 from dataclasses import MISSING
+import math
 
 import isaaclab.sim as sim_utils
 from isaaclab.envs.mdp.recorders.recorders_cfg import ActionStateRecorderManagerCfg as RecordTerm
@@ -51,8 +52,8 @@ class LTableSceneCfg(InteractiveSceneCfg):
     # so the ~50 other references still resolve); the converter exports it as cam_left_head.
     cam_head: CameraCfg = MISSING
     cam_right_head: CameraCfg = MISSING
-    cam_left_wrist: CameraCfg = MISSING
-    cam_right_wrist: CameraCfg = MISSING
+    cam_wrist_left: CameraCfg = MISSING
+    cam_wrist_right: CameraCfg = MISSING
 
     plane = AssetBaseCfg(
         prim_path="/World/GroundPlane",
@@ -125,13 +126,13 @@ class ObservationsCfg:
             func=mdp.image,
             params={"sensor_cfg": SceneEntityCfg("cam_right_head"), "data_type": "rgb", "normalize": False},
         )
-        cam_left_wrist = ObsTerm(
+        cam_wrist_left = ObsTerm(
             func=mdp.image,
-            params={"sensor_cfg": SceneEntityCfg("cam_left_wrist"), "data_type": "rgb", "normalize": False},
+            params={"sensor_cfg": SceneEntityCfg("cam_wrist_left"), "data_type": "rgb", "normalize": False},
         )
-        cam_right_wrist = ObsTerm(
+        cam_wrist_right = ObsTerm(
             func=mdp.image,
-            params={"sensor_cfg": SceneEntityCfg("cam_right_wrist"), "data_type": "rgb", "normalize": False},
+            params={"sensor_cfg": SceneEntityCfg("cam_wrist_right"), "data_type": "rgb", "normalize": False},
         )
 
         def __post_init__(self):
@@ -203,12 +204,77 @@ class PickPlaceLTableEnvCfg(ManagerBasedRLEnvCfg):
     events = None
     curriculum = None
 
+    # --- VR / Mimic L-motion (read by FFWSG2Sdk + LTableKinematicLMotion) ---
+    teleop_l_yaw: float = math.pi / 2.0
+    teleop_l_forward_m: float = 0.30
+    teleop_l_rotation_duration_s: float = 3.0
+    teleop_l_forward_duration_s: float = 2.0
+    teleop_l_target_label: str = "left table"
     teleop_l_use_swerve: bool = False
     teleop_auto_l_on_grip_s: float = 2.0
     # Plan B: free base driving from /cmd_vel instead of the scripted L-motion.
     # The mobile task variant sets this True (see FFWSG2PickPlaceLTableMobileEnvCfg).
     teleop_base_drive: bool = False
     teleop_cmd_vel_topic: str = "/cmd_vel"
+    # Optional swerve L-motion limits (used only when teleop_l_use_swerve=True).
+    teleop_l_swerve_yaw_tol: float = 0.08
+    teleop_l_swerve_max_angular_z: float = 0.6
+    teleop_l_swerve_max_linear_x: float = 0.25
+
+    # --- Reset home pose (applied by joint_pos EventCfg) ---
+    home_lift_joint: float = 0.0365
+    home_arm_joint1: float = 0.75
+    home_arm_joint4: float = -2.30
+    home_head_joint1: float = 0.549
+
+    # --- Grasp / soft-grip teleop tuning ---
+    grasp_diff_threshold: float = 0.18
+    gripper_close_threshold: float = 0.2
+    teleop_left_grip_smooth_alpha: float = 0.20
+    teleop_left_finger_hold_min: float = 0.12
+    teleop_left_finger_hold_alpha: float = 0.38
+    teleop_left_finger_hold_alpha_firm: float = 0.62
+    teleop_left_finger_firm_grip: float = 0.45
+
+    # --- Optional gripper actuator PD overrides (None = keep FFW_SG2 asset defaults) ---
+    gripper_l_stiffness: float | None = None
+    gripper_l_damping: float | None = None
+    gripper_r_stiffness: float | None = None
+    gripper_r_damping: float | None = None
+
+    def sync_configured_params(self) -> None:
+        """Push named teleop/home/grasp/PD fields into events, obs, and actuators.
+
+        Call after mutating these fields (e.g. from record_demos CLI) so dependent
+        EventTerm / ObsTerm / actuator knobs stay in sync without editing source.
+        """
+        try:
+            grasp = self.observations.subtask_terms.dual_grasp_box
+            grasp.params["diff_threshold"] = self.grasp_diff_threshold
+            grasp.params["gripper_close_threshold"] = self.gripper_close_threshold
+        except Exception:
+            pass
+        events = getattr(self, "events", None)
+        if events is not None and hasattr(events, "set_robot_joint_pose"):
+            events.set_robot_joint_pose.params["joint_positions"] = {
+                "arm_l_joint1": self.home_arm_joint1,
+                "arm_l_joint4": self.home_arm_joint4,
+                "arm_r_joint1": self.home_arm_joint1,
+                "arm_r_joint4": self.home_arm_joint4,
+                "head_joint1": self.home_head_joint1,
+                "lift_joint": self.home_lift_joint,
+            }
+        robot = getattr(getattr(self, "scene", None), "robot", None)
+        acts = getattr(robot, "actuators", None) if robot is not None else None
+        if isinstance(acts, dict):
+            if self.gripper_l_stiffness is not None and "gripper_l" in acts:
+                acts["gripper_l"].stiffness = self.gripper_l_stiffness
+            if self.gripper_l_damping is not None and "gripper_l" in acts:
+                acts["gripper_l"].damping = self.gripper_l_damping
+            if self.gripper_r_stiffness is not None and "gripper_r_master" in acts:
+                acts["gripper_r_master"].stiffness = self.gripper_r_stiffness
+            if self.gripper_r_damping is not None and "gripper_r_master" in acts:
+                acts["gripper_r_master"].damping = self.gripper_r_damping
 
     def __post_init__(self):
         self.decimation = 5
@@ -219,6 +285,7 @@ class PickPlaceLTableEnvCfg(ManagerBasedRLEnvCfg):
         self.sim.physx.gpu_found_lost_aggregate_pairs_capacity = 1024 * 1024 * 4
         self.sim.physx.gpu_total_aggregate_pairs_capacity = 16 * 1024
         self.sim.physx.friction_correlation_distance = 0.00625
+        self.sync_configured_params()
 
     def init_action_cfg(self, mode: str):
         if mode in ["record", "inference"]:
@@ -250,11 +317,13 @@ class PickPlaceLTableEnvCfg(ManagerBasedRLEnvCfg):
                 asset_name="robot",
                 joint_names=["head_joint1", "head_joint2"],
                 scale=1.0,
+                use_default_offset=False,
             )
             self.actions.lift_action = mdp.JointPositionActionCfg(
                 asset_name="robot",
                 joint_names=["lift_joint"],
                 scale=1.0,
+                use_default_offset=False,
             )
         elif mode in ["mimic_ik"]:
             self.actions.arm_l_action = DifferentialInverseKinematicsActionCfg(

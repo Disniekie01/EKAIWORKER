@@ -29,7 +29,7 @@ from rclpy.node import Node
 from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
 from scipy.spatial.transform import Rotation as R
 from sensor_msgs.msg import JointState
-from std_msgs.msg import Bool, Float32
+from std_msgs.msg import Bool, Float32, String
 from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
 from vuer import Vuer
 from vuer.schemas import Body, MotionControllers, Scene
@@ -38,6 +38,8 @@ from vuer.schemas import Body, MotionControllers, Scene
 nest_asyncio.apply()
 
 BODY_HEAD_INDEX = 6  # XRBodyJoint 'head'
+EPISODE_RESET_TOPIC = '/eykorea/episode_reset'
+EPISODE_RESET_PAYLOAD = 'reset'
 BODY_LEFT_SHOULDER_INDEX = 8  # XRBodyJoint 'left-scapula'
 BODY_LEFT_ELBOW_INDEX = 10  # XRBodyJoint 'left-arm-lower'
 BODY_RIGHT_SHOULDER_INDEX = 13  # XRBodyJoint 'right-scapula'
@@ -165,8 +167,11 @@ class VRTrajectoryPublisher(Node):
             '/leader/joint_trajectory_command_broadcaster_right/joint_trajectory',
             self.vr_command_qos
         )
+        # RELIABLE (vr_command_qos) so it matches the SG2 SDK's RELIABLE /cmd_vel reader --
+        # a BEST_EFFORT publisher does not match a RELIABLE subscriber in DDS, which silently
+        # dropped every base command (the arms/lift/head commands already use vr_command_qos).
         self.cmd_vel_pub = self.create_publisher(
-            Twist, '/cmd_vel', self.vr_stream_qos
+            Twist, '/cmd_vel', self.vr_command_qos
         )
 
         # Wrist/elbow pose publishers for visualization
@@ -197,6 +202,12 @@ class VRTrajectoryPublisher(Node):
         self.both_b_buttons_pressed_prev = False
         self.both_squeezes_prev = False
         self.last_reactivate_state = None
+        self.episode_reset_sub = self.create_subscription(
+            String,
+            EPISODE_RESET_TOPIC,
+            self.episode_reset_callback,
+            10,
+        )
 
         self.joint_states_sub = self.create_subscription(
             JointState,
@@ -364,9 +375,17 @@ class VRTrajectoryPublisher(Node):
         self.joystick_mode = True
         self.prev_left_thumbstick_pressed = False
         self.prev_right_thumbstick_pressed = False
+        # Left Y button (= left controller bButton) toggles LIFT+HEAD <-> LIFT+CMD_VEL.
+        # More reliable than the both-thumbstick click, which is easy to mis-trigger.
+        self.prev_mode_button_pressed = False
         self.linear_x_scale = 5.0
         self.linear_y_scale = 5.0
         self.angular_z_scale = 3.0
+        # Base rotation is driven by the right controller's A / B buttons instead of the
+        # right thumbstick: A = turn right (angular.z < 0), B = turn left (angular.z > 0).
+        # Held = continuous turn at this rate (rad/s). The right thumbstick still works as a
+        # fallback when neither button is pressed.
+        self.button_turn_rate = 0.8
         # Match joystick_controller parameters
         self.left_jog_scale = 0.06
         self.right_jog_scale = 0.005
@@ -470,6 +489,51 @@ class VRTrajectoryPublisher(Node):
                 f'{state_text}{reason_text}'
             )
         self.last_reactivate_state = msg.data
+
+    def episode_reset_callback(self, msg):
+        """Clear VR/controller leftovers when Isaac requests an episode reset (R)."""
+        payload = (msg.data or '').strip().lower()
+        if payload and payload != EPISODE_RESET_PAYLOAD:
+            return
+        self._clear_episode_controller_state(reason='isaac episode reset')
+
+    def _clear_episode_controller_state(self, reason='episode reset'):
+        """Pause VR publishing and drop cached controller/lift references."""
+        self.vr_publishing_enabled = False
+        self.left_controller_matrix = None
+        self.right_controller_matrix = None
+        self.left_elbow_matrix = None
+        self.right_elbow_matrix = None
+        self.left_shoulder_matrix = None
+        self.right_shoulder_matrix = None
+        self.pending_body_pose_frame = False
+        self.pending_controller_pose_frame = False
+        self.left_squeeze_value = 0.0
+        self.right_squeeze_value = 0.0
+        self.both_a_buttons_pressed_prev = False
+        self.both_b_buttons_pressed_prev = False
+        self.both_squeezes_prev = False
+        self.lift_reference_position_for_pose = None
+        self.last_head_command = None
+        self.last_lift_command = None
+        self.last_cmd_vel_command = (0.0, 0.0, 0.0)
+        # Hard-stop base motion so leftover thumbstick command cannot move the base.
+        twist_msg = Twist()
+        self.cmd_vel_pub.publish(twist_msg)
+        self._publish_reactivate(False, reason=reason, force_log=True)
+        self.get_logger().info(
+            f'[RESET] VR controller state cleared ({reason}). '
+            'Re-squeeze both grips or press both A to resume teleop.'
+        )
+
+    def _enable_vr_publishing(self, reason=None):
+        """Resume VR publishing after an episode reset with fresh lift reference."""
+        if self.vr_publishing_enabled:
+            return
+        self.vr_publishing_enabled = True
+        self.lift_reference_position_for_pose = None
+        reason_text = f' ({reason})' if reason else ''
+        self.get_logger().info(f'[RESET] VR publishing re-enabled{reason_text}')
 
     def _both_squeezes_active(self):
         """Return True while both squeeze inputs stay above threshold."""
@@ -938,17 +1002,33 @@ class VRTrajectoryPublisher(Node):
             self.prev_left_thumbstick_pressed = left_thumbstick_pressed
             self.prev_right_thumbstick_pressed = right_thumbstick_pressed
 
+            # Toggle mode on the left Y button (bButton) rising edge -- a dedicated,
+            # reliable control instead of the finicky both-thumbstick click.
+            mode_button = (
+                bool(self.left_controller_state.get('bButton', False))
+                if isinstance(self.left_controller_state, dict) else False
+            )
+            if mode_button and not self.prev_mode_button_pressed:
+                self.joystick_mode = not self.joystick_mode
+                mode_name = 'LIFT+HEAD' if self.joystick_mode else 'LIFT+CMD_VEL'
+                self.get_logger().info(f'[Y-BUTTON] Mode switched to: {mode_name}')
+                if self.joystick_mode:
+                    # Stop the base when leaving cmd_vel mode.
+                    self.publish_cmd_vel_from_thumbstick([0.0, 0.0], [0.0, 0.0])
+            self.prev_mode_button_pressed = mode_button
+
             # Lift always follows right Y axis.
             # Match joystick_controller: lift uses right X axis.
             if abs(right_thumbstick_value[0]) > 0.0:
                 self.publish_right_joystick(right_thumbstick_value[0])
 
-            # Left stick controls head in joystick_mode, otherwise base cmd_vel.
+            # Head mode: left stick drives the head. Base cmd_vel is published every cycle so
+            # A/B rotation works in both modes; thumbstick translation is gated to cmd_vel mode
+            # inside publish_cmd_vel_from_thumbstick.
             if self.joystick_mode:
                 if abs(left_thumbstick_value[0]) > 0.0 or abs(left_thumbstick_value[1]) > 0.0:
                     self.publish_left_joystick_from_thumbstick(left_thumbstick_value)
-            else:
-                self.publish_cmd_vel_from_thumbstick(left_thumbstick_value, right_thumbstick_value)
+            self.publish_cmd_vel_from_thumbstick(left_thumbstick_value, right_thumbstick_value)
 
         except Exception as e:
             self.get_logger().error(f'Error processing thumbstick: {e}')
@@ -1054,9 +1134,27 @@ class VRTrajectoryPublisher(Node):
             if not self.vr_publishing_enabled:
                 return
 
-            left_x_deadzone = self.apply_deadzone(float(left_thumbstick_value[0]))
-            left_y_deadzone = self.apply_deadzone(float(left_thumbstick_value[1]))
-            right_y_deadzone = self.apply_deadzone(float(right_thumbstick_value[1]))
+            # Thumbstick translation only applies in cmd_vel mode; in head mode the left stick
+            # drives the head. A/B rotation (below) applies in BOTH modes so the operator can
+            # always turn the base without hunting for the right mode.
+            if not self.joystick_mode:  # LIFT+CMD_VEL
+                left_x_deadzone = self.apply_deadzone(float(left_thumbstick_value[0]))
+                left_y_deadzone = self.apply_deadzone(float(left_thumbstick_value[1]))
+                right_y_deadzone = self.apply_deadzone(float(right_thumbstick_value[1]))
+            else:
+                left_x_deadzone = left_y_deadzone = right_y_deadzone = 0.0
+
+            # Base rotation from the right controller's A / B buttons (held = continuous).
+            # A -> turn right (angular.z < 0), B -> turn left (angular.z > 0). Falls back to
+            # the right thumbstick when neither button is pressed.
+            rc = self.right_controller_state if isinstance(self.right_controller_state, dict) else {}
+            a_pressed = bool(rc.get('aButton', False))
+            b_pressed = bool(rc.get('bButton', False))
+            button_angular = 0.0
+            if a_pressed:
+                button_angular -= self.button_turn_rate
+            if b_pressed:
+                button_angular += self.button_turn_rate
 
             twist_msg = Twist()
             # Apply requested sign convention for SG2 base linear axes.
@@ -1065,7 +1163,10 @@ class VRTrajectoryPublisher(Node):
             twist_msg.linear.z = 0.0
             twist_msg.angular.x = 0.0
             twist_msg.angular.y = 0.0
-            twist_msg.angular.z = -right_y_deadzone / self.angular_z_scale
+            twist_msg.angular.z = (
+                button_angular if button_angular != 0.0
+                else -right_y_deadzone / self.angular_z_scale
+            )
 
             cmd_tuple = (twist_msg.linear.x, twist_msg.linear.y, twist_msg.angular.z)
             is_same_command = (
@@ -1338,6 +1439,7 @@ class VRTrajectoryPublisher(Node):
             )
             both_a_now = left_a and right_a
             if both_a_now and not self.both_a_buttons_pressed_prev:
+                self._enable_vr_publishing(reason='both A buttons')
                 self._publish_reactivate(True, reason='both A buttons', force_log=True)
             self.both_a_buttons_pressed_prev = both_a_now
 
@@ -1370,11 +1472,13 @@ class VRTrajectoryPublisher(Node):
                 )
                 self._btn_dbg_prev = _btn_dbg
             if both_b_now and not self.both_b_buttons_pressed_prev:
+                self.vr_publishing_enabled = False
                 self._publish_reactivate(False, reason='both B buttons', force_log=True)
             self.both_b_buttons_pressed_prev = both_b_now
 
             both_squeezes_now = self._both_squeezes_active()
             if both_squeezes_now and not self.both_squeezes_prev:
+                self._enable_vr_publishing(reason='both squeezes engaged')
                 self._publish_reactivate(
                     True, reason='both squeezes engaged', force_log=True
                 )
