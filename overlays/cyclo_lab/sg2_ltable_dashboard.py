@@ -120,6 +120,23 @@ _selected_task = next(
 )
 ROBOT_TYPE = os.environ.get("ROBOT_TYPE", "FFW_SG2")
 NUM_DEMOS = os.environ.get("NUM_DEMOS", "0")
+# Optional record_demos teleop/home overrides (empty = task cfg defaults).
+# (ui_key, env_key, cli_flag, placeholder for L-table defaults)
+_TELEOP_CFG_FIELDS = (
+    ("teleop_l_forward_m", "TELEOP_L_FORWARD_M", "--teleop-l-forward-m", "0.30"),
+    ("teleop_l_yaw", "TELEOP_L_YAW", "--teleop-l-yaw", "1.5708"),
+    ("teleop_l_rotation_duration_s", "TELEOP_L_ROTATION_DURATION_S", "--teleop-l-rotation-duration-s", "3.0"),
+    ("teleop_l_forward_duration_s", "TELEOP_L_FORWARD_DURATION_S", "--teleop-l-forward-duration-s", "2.0"),
+    ("teleop_auto_l_on_grip_s", "TELEOP_AUTO_L_ON_GRIP_S", "--teleop-auto-l-on-grip-s", "2.0"),
+    ("home_lift_joint", "HOME_LIFT_JOINT", "--home-lift-joint", "0.0365"),
+    ("home_arm_joint1", "HOME_ARM_JOINT1", "--home-arm-joint1", "0.75"),
+    ("home_arm_joint4", "HOME_ARM_JOINT4", "--home-arm-joint4", "-2.30"),
+    ("home_head_joint1", "HOME_HEAD_JOINT1", "--home-head-joint1", "0.549"),
+    ("grasp_diff_threshold", "GRASP_DIFF_THRESHOLD", "--grasp-diff-threshold", "0.18"),
+    ("gripper_close_threshold", "GRIPPER_CLOSE_THRESHOLD", "--gripper-close-threshold", "0.2"),
+    ("gripper_l_stiffness", "GRIPPER_L_STIFFNESS", "--gripper-l-stiffness", "asset default"),
+    ("gripper_l_damping", "GRIPPER_L_DAMPING", "--gripper-l-damping", "asset default"),
+)
 AUTO_SUCCESS = os.environ.get("AUTO_SUCCESS", "0") in ("1", "true", "True")
 PIPELINE_STEPS = ("ik", "annotate", "generate", "joint", "lerobot")
 PIPELINE_STEP_INPUT = {
@@ -145,6 +162,10 @@ PIPELINE_STEP_LABEL = {
 }
 GENERATION_NUM_TRIALS = os.environ.get("GENERATION_NUM_TRIALS", "500")
 PIPELINE_NUM_ENVS = os.environ.get("PIPELINE_NUM_ENVS", "10")
+# Experimental sidecars (not in PIPELINE_STEPS).
+RAW_RATIO = float(os.environ.get("RAW_RATIO", "1.0"))
+GENERATE_RATIO = float(os.environ.get("GENERATE_RATIO", "1.0"))
+MERGE_SEED = int(os.environ.get("MERGE_SEED", "0"))
 CYCLO_C = "cyclo_lab"
 VR_C = "robotis-applications"
 AI_C = "ai_worker"
@@ -155,14 +176,23 @@ ENV_ROS = f"export ROS_DOMAIN_ID={ROS_DOMAIN_ID} && export RMW_IMPLEMENTATION={R
 
 _lock = threading.Lock()
 _logs: dict[str, list[str]] = {
-    k: [] for k in ("cyclo", "vr", "ai", "recorder", "isaac", "pipeline", *(
-        f"pipe_{s}" for s in PIPELINE_STEPS
-    ))
+    k: [] for k in (
+        "cyclo", "vr", "ai", "recorder", "isaac", "pipeline",
+        "experimental_merge", "experimental_lerobot_v3", "experimental_lerobot_mixed",
+        *(f"pipe_{s}" for s in PIPELINE_STEPS)
+    )
 }
 _status: dict[str, str] = {k: "stopped" for k in _logs}
+_merge_ratios: dict[str, float] = {"raw_ratio": RAW_RATIO, "generate_ratio": GENERATE_RATIO}
+_merge_seed: int = MERGE_SEED
 _launch_ts: dict[str, float] = {}
 _active_teleop_robot: str | None = None
 _auto_success: bool = AUTO_SUCCESS
+# UI-stored teleop overrides; empty string = omit flag (task cfg / env fallback).
+_teleop_config: dict[str, str] = {
+    key: os.environ.get(env_key, "").strip()
+    for key, env_key, _, _ in _TELEOP_CFG_FIELDS
+}
 STARTING_GRACE_S = 90.0
 TELEOP_WARMUP_S = 6.0
 
@@ -219,6 +249,21 @@ def _set_auto_success(enabled: bool) -> None:
         _auto_success = enabled
     mode = "auto (task success)" if enabled else "manual (N / right trigger)"
     _log("cyclo", f"record save mode: {mode}")
+
+
+def _set_teleop_config(data: dict) -> dict[str, str]:
+    """Update UI teleop overrides. Empty / missing values clear that override."""
+    global _teleop_config
+    with _lock:
+        for key, _, _, _ in _TELEOP_CFG_FIELDS:
+            if key not in data:
+                continue
+            raw = data.get(key)
+            _teleop_config[key] = "" if raw is None else str(raw).strip()
+        out = dict(_teleop_config)
+    set_keys = [k for k, v in out.items() if v]
+    _log("cyclo", f"teleop config: {len(set_keys)} override(s)" + (f" ({', '.join(set_keys)})" if set_keys else ""))
+    return out
 
 
 def _run(cmd: list[str], cwd: Path | None = None) -> tuple[int, str]:
@@ -446,6 +491,19 @@ def launch_vr() -> tuple[bool, str]:
     return _spawn("vr", VR_C, cmd)
 
 
+def _teleop_cli_flags() -> str:
+    """Build optional record_demos CLI from UI config, else TELEOP_* / HOME_* / GRIPPER_* env."""
+    with _lock:
+        cfg = dict(_teleop_config)
+    parts: list[str] = []
+    for key, env_key, flag, _ph in _TELEOP_CFG_FIELDS:
+        raw = cfg.get(key, "").strip() or os.environ.get(env_key, "").strip()
+        if not raw:
+            continue
+        parts.append(f"{flag} {raw}")
+    return (" " + " ".join(parts)) if parts else ""
+
+
 def launch_recorder(*, ensure_teleop: bool = True) -> tuple[bool, str]:
     task = _current_task()
     profile = _current_robot_profile()
@@ -456,13 +514,16 @@ def launch_recorder(*, ensure_teleop: bool = True) -> tuple[bool, str]:
             return False, "teleop stack failed; see vr/ai logs"
     ds = f"{REPO_IN}/datasets/{task['dataset']}"
     auto_flag = " --auto_success" if _auto_success else ""
+    teleop_flags = _teleop_cli_flags()
     _log("recorder", f"task: {task['label']} -> {task['id']} ({profile['robot_type']})")
     _log("recorder", f"save mode: {'auto success' if _auto_success else 'manual'}")
+    if teleop_flags:
+        _log("recorder", f"teleop/cfg overrides:{teleop_flags}")
     cmd = (
         f"cd {REPO_IN} && export DISPLAY=:1 && {ENV_ROS} && "
         f"{ISAAC_PY} scripts/sim2real/imitation_learning/recorder/record_demos.py "
         f"--task={task['id']} --robot_type {profile['robot_type']} "
-        f"--dataset_file {ds} --num_demos {NUM_DEMOS}{auto_flag} --enable_cameras"
+        f"--dataset_file {ds} --num_demos {NUM_DEMOS}{auto_flag}{teleop_flags} --enable_cameras"
     )
     return _spawn("recorder", CYCLO_C, cmd)
 
@@ -526,6 +587,7 @@ def _pipeline_paths(task: dict[str, str]) -> dict[str, str]:
         "annotate": f"{ds}/{base}_annotate.hdf5",
         "generate": f"{ds}/{base}_generate.hdf5",
         "joint": f"{ds}/{base}_joint.hdf5",
+        "mixed": f"{ds}/{base}_mixed.hdf5",
     }
 
 
@@ -639,8 +701,150 @@ def kill_pipeline() -> tuple[bool, str]:
     killed = "killed" in (out or "")
     for step in PIPELINE_STEPS:
         _set_status(f"pipe_{step}", "stopped")
+    _set_status("experimental_lerobot_v3", "stopped")
     _log("pipeline", f"kill -> {out.strip() if out else '(no output)'}")
     return killed, out or "no output"
+
+
+def _lerobot_v3_python_ready() -> bool:
+    """True if experimental lerobot>=0.4 interpreter is available in the container."""
+    check = (
+        'test -x "${LEROBOT_V3_PYTHON:-}" || '
+        "command -v lerobot-python-v3 >/dev/null || "
+        'test -x "$HOME/lerobot_env_v3/bin/python3" || '
+        "test -x /root/lerobot_env_v3/bin/python3"
+    )
+    code, _ = _run(["docker", "exec", CYCLO_C, "bash", "-lc", check])
+    return code == 0
+
+
+def launch_lerobot_v3(*, prefer_mixed: bool = False) -> tuple[bool, str]:
+    """Experimental: export LeRobot dataset format v3.0 (does not change Mimic pipeline)."""
+    if not _docker_running(CYCLO_C):
+        return False, f"{CYCLO_C} container is not running"
+    if _proc_running(CYCLO_C, "[i]saaclab2lerobot.py"):
+        return False, "isaaclab2lerobot.py already running; wait or Kill pipeline"
+    if not _lerobot_v3_python_ready():
+        return (
+            False,
+            "experimental v3 venv missing; run "
+            "scripts/sim2real/imitation_learning/data_converter/setup_lerobot_v3_env.sh "
+            "inside cyclo_lab",
+        )
+    task = _current_task()
+    profile = _current_robot_profile()
+    paths = _pipeline_paths(task)
+    robot = profile["robot_type"]
+    record_id = task["id"]
+    dataset_file = paths["joint"]
+    if prefer_mixed and _container_file_exists(paths["mixed"]):
+        dataset_file = paths["mixed"]
+    elif not _container_file_exists(dataset_file):
+        return False, f"missing joint hdf5 for v3 export: {dataset_file}"
+    cmd = (
+        f"cd {REPO_IN} && export PATH=\"$HOME/.local/bin:$PATH\" && "
+        f"lerobot-python scripts/sim2real/imitation_learning/data_converter/isaaclab2lerobot.py "
+        f"--task={record_id} --robot_type {robot} --dataset_file {dataset_file} "
+        f"--dataset_format v3"
+    )
+    _log("experimental_lerobot_v3", f"start v3 export from {dataset_file}")
+    return _spawn("experimental_lerobot_v3", CYCLO_C, cmd, log_suffix="experimental_lerobot_v3")
+
+
+def kill_lerobot_v3() -> tuple[bool, str]:
+    cmd = (
+        'pkill -9 -f "[i]saaclab2lerobot.py.*--dataset_format v3" 2>/dev/null; '
+        "sleep 1; "
+        'pgrep -f "[i]saaclab2lerobot.py.*--dataset_format v3" >/dev/null && echo "still-running" || echo "killed"'
+    )
+    code, out = _run(["docker", "exec", CYCLO_C, "bash", "-lc", cmd])
+    _set_status("experimental_lerobot_v3", "stopped")
+    _log("experimental_lerobot_v3", f"kill -> {out.strip() if out else '(no output)'}")
+    return "killed" in (out or ""), out or "no output"
+
+
+def _clip01(x: float) -> float:
+    return max(0.0, min(1.0, float(x)))
+
+
+def _set_merge_ratios(raw_ratio: float | None, generate_ratio: float | None, seed: int | None = None) -> None:
+    global _merge_seed
+    with _lock:
+        if raw_ratio is not None:
+            _merge_ratios["raw_ratio"] = _clip01(raw_ratio)
+        if generate_ratio is not None:
+            _merge_ratios["generate_ratio"] = _clip01(generate_ratio)
+        if seed is not None:
+            _merge_seed = int(seed)
+
+
+def launch_merge(
+    *,
+    raw_ratio: float | None = None,
+    generate_ratio: float | None = None,
+    seed: int | None = None,
+) -> tuple[bool, str]:
+    """Experimental: merge raw + joint HDF5 into *_mixed.hdf5 (not part of Mimic pipeline)."""
+    if not _docker_running(CYCLO_C):
+        return False, f"{CYCLO_C} container is not running"
+    if _proc_running(CYCLO_C, "[m]erge_joint_datasets.py"):
+        return False, "merge_joint_datasets.py already running"
+    if raw_ratio is not None or generate_ratio is not None or seed is not None:
+        _set_merge_ratios(raw_ratio, generate_ratio, seed)
+    task = _current_task()
+    profile = _current_robot_profile()
+    paths = _pipeline_paths(task)
+    robot = profile["robot_type"]
+    if not _container_file_exists(paths["raw"]):
+        return False, f"missing raw hdf5: {paths['raw']}"
+    if not _container_file_exists(paths["joint"]):
+        return False, f"missing joint hdf5: {paths['joint']}"
+    with _lock:
+        rr = _merge_ratios["raw_ratio"]
+        gr = _merge_ratios["generate_ratio"]
+        mseed = _merge_seed
+    cmd = (
+        f"cd {REPO_IN} && "
+        f"PY=/root/lerobot_env/bin/python3; test -x \"$PY\" || PY=python3; "
+        f"\"$PY\" scripts/sim2real/imitation_learning/mimic/merge_joint_datasets.py "
+        f"--robot_type {robot} --raw_file {paths['raw']} --joint_file {paths['joint']} "
+        f"--output_file {paths['mixed']} --raw_ratio {rr} --generate_ratio {gr} --seed {mseed}"
+    )
+    _log("experimental_merge", f"start merge raw_ratio={rr} generate_ratio={gr} seed={mseed}")
+    return _spawn("experimental_merge", CYCLO_C, cmd, log_suffix="experimental_merge")
+
+
+def kill_merge() -> tuple[bool, str]:
+    cmd = (
+        'pkill -9 -f "[m]erge_joint_datasets.py" 2>/dev/null; '
+        "sleep 1; "
+        'pgrep -f "[m]erge_joint_datasets.py" >/dev/null && echo "still-running" || echo "killed"'
+    )
+    code, out = _run(["docker", "exec", CYCLO_C, "bash", "-lc", cmd])
+    _set_status("experimental_merge", "stopped")
+    _log("experimental_merge", f"kill -> {out.strip() if out else '(no output)'}")
+    return "killed" in (out or ""), out or "no output"
+
+
+def launch_lerobot_from_mixed() -> tuple[bool, str]:
+    """Experimental: LeRobot v2.1 export from *_mixed.hdf5 (Mimic step 5 still uses joint)."""
+    if not _docker_running(CYCLO_C):
+        return False, f"{CYCLO_C} container is not running"
+    if _proc_running(CYCLO_C, "[i]saaclab2lerobot.py"):
+        return False, "isaaclab2lerobot.py already running; wait or Kill pipeline"
+    task = _current_task()
+    profile = _current_robot_profile()
+    paths = _pipeline_paths(task)
+    if not _container_file_exists(paths["mixed"]):
+        return False, f"missing mixed hdf5: {paths['mixed']} (run Merge first)"
+    robot = profile["robot_type"]
+    record_id = task["id"]
+    cmd = (
+        f"cd {REPO_IN} && lerobot-python scripts/sim2real/imitation_learning/data_converter/isaaclab2lerobot.py "
+        f"--task={record_id} --robot_type {robot} --dataset_file {paths['mixed']}"
+    )
+    _log("experimental_lerobot_mixed", f"start LeRobot from mixed {paths['mixed']}")
+    return _spawn("experimental_lerobot_mixed", CYCLO_C, cmd, log_suffix="experimental_lerobot_mixed")
 
 
 def _proc_running(container: str, pattern: str) -> bool:
@@ -657,6 +861,36 @@ def _reconcile(key: str, container_up: bool, container: str, pattern: str) -> No
         _set_status(key, "stopped")
         return
     if _proc_running(container, pattern):
+        _set_status(key, "running")
+        return
+    with _lock:
+        cur = _status.get(key)
+        ts = _launch_ts.get(key, 0.0)
+    if cur == "starting" and (time.time() - ts) < STARTING_GRACE_S:
+        return
+    _set_status(key, "stopped")
+
+
+def _lerobot_v3_running() -> bool:
+    code, out = _run(
+        [
+            "docker",
+            "exec",
+            CYCLO_C,
+            "bash",
+            "-lc",
+            "pgrep -af '[i]saaclab2lerobot.py' 2>/dev/null | grep -E 'dataset_format(=| )v3' >/dev/null && echo yes || echo no",
+        ]
+    )
+    return code == 0 and out.strip() == "yes"
+
+
+def _reconcile_lerobot_v3(container_up: bool) -> None:
+    key = "experimental_lerobot_v3"
+    if not container_up:
+        _set_status(key, "stopped")
+        return
+    if _lerobot_v3_running():
         _set_status(key, "running")
         return
     with _lock:
@@ -689,10 +923,41 @@ def snapshot() -> dict:
             CYCLO_C,
             PIPELINE_PROC_PATTERN[step],
         )
+    _reconcile_lerobot_v3(containers.get(CYCLO_C, False))
+    _reconcile(
+        "experimental_merge",
+        containers.get(CYCLO_C, False),
+        CYCLO_C,
+        "[m]erge_joint_datasets.py",
+    )
+    # LeRobot-from-mixed: only mark running when cmdline references *_mixed.hdf5
+    key_mixed = "experimental_lerobot_mixed"
+    if not containers.get(CYCLO_C, False):
+        _set_status(key_mixed, "stopped")
+    else:
+        code, out = _run(
+            [
+                "docker",
+                "exec",
+                CYCLO_C,
+                "bash",
+                "-lc",
+                "pgrep -af '[i]saaclab2lerobot.py' 2>/dev/null | grep -q '_mixed.hdf5' && echo yes || echo no",
+            ]
+        )
+        if code == 0 and out.strip() == "yes":
+            _set_status(key_mixed, "running")
+        else:
+            with _lock:
+                cur = _status.get(key_mixed)
+                ts = _launch_ts.get(key_mixed, 0.0)
+            if not (cur == "starting" and (time.time() - ts) < STARTING_GRACE_S):
+                _set_status(key_mixed, "stopped")
     with _lock:
         st = dict(_status)
         logs_tail = {k: v[-30:] for k, v in _logs.items()}
         auto_success = _auto_success
+        teleop_cfg = dict(_teleop_config)
     task = _current_task()
     profile = _current_robot_profile()
     paths = _pipeline_paths(task)
@@ -704,6 +969,9 @@ def snapshot() -> dict:
     vr_running = _running_vr_model()
     hand_running = _running_ai_hand()
     teleop_ok = _teleop_stack_matches(profile)
+    cyclo_up = bool(containers.get(CYCLO_C))
+    joint_ready = cyclo_up and _container_file_exists(paths["joint"])
+    mixed_ready = cyclo_up and _container_file_exists(paths["mixed"])
     return {
         "containers": containers,
         "status": st,
@@ -719,6 +987,7 @@ def snapshot() -> dict:
         "running_ai_hand": hand_running,
         "grip": _read_teleop_grip(),
         "auto_success": auto_success,
+        "teleop_config": teleop_cfg,
         "tasks": list(TASKS.keys()),
         "pipeline": {
             "paths": paths,
@@ -727,6 +996,29 @@ def snapshot() -> dict:
             "num_envs": PIPELINE_NUM_ENVS,
             "steps": step_status,
             "inputs_ready": inputs_ready,
+        },
+        "experimental": {
+            "merge": {
+                "status": st.get("experimental_merge", "stopped"),
+                "raw_ready": cyclo_up and _container_file_exists(paths["raw"]),
+                "joint_ready": joint_ready,
+                "mixed_ready": mixed_ready,
+                "raw_ratio": _merge_ratios["raw_ratio"],
+                "generate_ratio": _merge_ratios["generate_ratio"],
+                "seed": _merge_seed,
+                "note": "Experimental; not part of Full Mimic pipeline.",
+            },
+            "lerobot_mixed": {
+                "status": st.get("experimental_lerobot_mixed", "stopped"),
+                "mixed_ready": mixed_ready,
+            },
+            "lerobot_v3": {
+                "status": st.get("experimental_lerobot_v3", "stopped"),
+                "venv_ready": _lerobot_v3_python_ready() if cyclo_up else False,
+                "joint_ready": joint_ready,
+                "mixed_ready": mixed_ready,
+                "note": "Experimental; does not replace Mimic step 5 (v2.1).",
+            },
         },
         "tasks_by_robot": {
             robot: [label for label, t in TASKS.items() if t["robot"] == robot]
@@ -759,6 +1051,10 @@ a{color:#60a5fa}
 .vr-steps .step-n{font-weight:700;color:#93c5fd;margin-right:.35rem}
 .vr-url{display:block;margin-top:.35rem;padding:.5rem .6rem;background:#252a36;border-radius:6px;font-size:.8rem;word-break:break-all;font-family:ui-monospace,monospace}
 .vr-note{font-size:.85rem;color:#9ca3af;margin-top:.5rem}
+.cfg-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:.5rem .75rem;margin:.5rem 0}
+.cfg-compact{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:.5rem .75rem;margin:.35rem 0}
+.cfg-grid label,.cfg-compact label{display:flex;flex-direction:column;gap:.25rem;font-size:.75rem;color:#9ca3af}
+.cfg-grid input,.cfg-compact input{background:#0a0c10;color:#e8eaed;border:1px solid #2a2f3d;border-radius:6px;padding:.35rem .45rem;font-size:.85rem;width:100%}
 </style></head><body>
 <header><h1>FFW VR + Recorder Dashboard</h1></header>
 <main>
@@ -802,6 +1098,35 @@ a{color:#60a5fa}
 <li><span class="step-n">Bad take?</span>Press <b>R</b> in Isaac to <b>discard</b> and restart (does not save).</li>
 </ol>
 <p class="vr-note">Repeat: <b>B</b> before every new take. SH5 hand tasks: use hand gesture to enable VR publishing; lift with <b>I</b>/<b>O</b> in Isaac.</p>
+<p class="vr-note">L-motion / lift / grasp knobs: use the <b>Config</b> card below (or shell env / <code>record_demos.py</code> flags). Empty fields keep task cfg defaults.</p>
+</div>
+<div class="card"><h3>Config — L-motion / home / grasp</h3>
+<p class="tag">Overrides applied on <b>Launch Record</b> / Isaac Only. Leave blank for task cfg defaults (placeholders show L-table typicals). Shell env still used if a field is empty.</p>
+<div class="cfg-grid">
+<label>teleop_l_forward_m<input id="cfg_teleop_l_forward_m" type="text" inputmode="decimal" placeholder="0.30"></label>
+<label>teleop_l_yaw<input id="cfg_teleop_l_yaw" type="text" inputmode="decimal" placeholder="1.5708"></label>
+<label>teleop_l_rotation_duration_s<input id="cfg_teleop_l_rotation_duration_s" type="text" inputmode="decimal" placeholder="3.0"></label>
+<label>teleop_l_forward_duration_s<input id="cfg_teleop_l_forward_duration_s" type="text" inputmode="decimal" placeholder="2.0"></label>
+<label>teleop_auto_l_on_grip_s<input id="cfg_teleop_auto_l_on_grip_s" type="text" inputmode="decimal" placeholder="2.0"></label>
+<label>home_lift_joint<input id="cfg_home_lift_joint" type="text" inputmode="decimal" placeholder="0.0365"></label>
+<label>grasp_diff_threshold<input id="cfg_grasp_diff_threshold" type="text" inputmode="decimal" placeholder="0.18"></label>
+<label>gripper_close_threshold<input id="cfg_gripper_close_threshold" type="text" inputmode="decimal" placeholder="0.2"></label>
+</div>
+<p class="vr-note" style="margin-bottom:.25rem">Home arm / head (optional)</p>
+<div class="cfg-compact">
+<label>home_arm_joint1<input id="cfg_home_arm_joint1" type="text" inputmode="decimal" placeholder="0.75"></label>
+<label>home_arm_joint4<input id="cfg_home_arm_joint4" type="text" inputmode="decimal" placeholder="-2.30"></label>
+<label>home_head_joint1<input id="cfg_home_head_joint1" type="text" inputmode="decimal" placeholder="0.549"></label>
+</div>
+<p class="vr-note" style="margin-bottom:.25rem">Gripper PD (optional)</p>
+<div class="cfg-compact">
+<label>gripper_l_stiffness<input id="cfg_gripper_l_stiffness" type="text" inputmode="decimal" placeholder="asset default"></label>
+<label>gripper_l_damping<input id="cfg_gripper_l_damping" type="text" inputmode="decimal" placeholder="asset default"></label>
+</div>
+<div class="row" style="margin-top:.75rem;margin-bottom:0">
+<button class="secondary" onclick="saveTeleopConfig()">Apply config</button>
+<button class="secondary" onclick="clearTeleopConfig()">Clear all</button>
+</div>
 </div>
 <div class="card"><h3>Mimic pipeline</h3>
 <p class="tag">After recording <code>*_raw.hdf5</code>, run steps <b>one at a time</b> in order. Logs: <code>/tmp/sg2_ltable_pipe_&lt;step&gt;.log</code></p>
@@ -819,13 +1144,88 @@ a{color:#60a5fa}
 </div>
 <pre id="pipeline_paths" style="font-size:.7rem;margin-top:.5rem"></pre>
 </div>
+<div class="card"><h3>Merge datasets <span class="tag">Experimental</span></h3>
+<p class="tag">Standalone raw + joint → <code>*_mixed.hdf5</code>. Does <b>not</b> run in Full pipeline; leaves <code>*_joint.hdf5</code> and Mimic LeRobot step unchanged.</p>
+<div class="row" style="align-items:center">
+<label>raw_ratio <input id="raw_ratio" type="number" min="0" max="1" step="0.05" value="1" style="width:4.5rem;background:#0a0c10;color:#e8eaed;border:1px solid #2a2f3d;border-radius:6px;padding:.3rem"></label>
+<label>generate_ratio <input id="generate_ratio" type="number" min="0" max="1" step="0.05" value="1" style="width:4.5rem;background:#0a0c10;color:#e8eaed;border:1px solid #2a2f3d;border-radius:6px;padding:.3rem"></label>
+<button class="secondary" onclick="runMerge()">Merge raw + joint</button>
+<button class="secondary" onclick="lerobotMixed()">LeRobot from mixed (Experimental)</button>
+<button class="danger" onclick="act('kill_merge')">Kill merge</button>
+</div>
+<pre id="merge_status" style="font-size:.7rem;margin-top:.5rem"></pre>
+</div>
+<div class="card"><h3>LeRobot v3.0 export <span class="tag">Experimental</span></h3>
+<p class="tag">Does <b>not</b> replace Mimic step 5 (default stays LeRobot <b>v2.1</b>). Writes under <code>datasets/lerobot_v3/</code>. Requires opt-in venv: <code>setup_lerobot_v3_env.sh</code>.</p>
+<div class="row">
+<button class="secondary" id="btn_lerobot_v3" onclick="lerobotV3(false)">Export joint → v3.0</button>
+<button class="secondary" id="btn_lerobot_v3_mixed" onclick="lerobotV3(true)">Export mixed → v3.0</button>
+<button class="danger" onclick="act('kill_lerobot_v3')">Kill v3 export</button>
+</div>
+<pre id="lerobot_v3_status" style="font-size:.7rem;margin-top:.5rem"></pre>
+</div>
 <div class="card"><div id="meta"></div><div class="grid" id="status"></div></div>
 <div class="card"><h3>Logs</h3><pre id="logs"></pre></div>
 </main>
 <script>
-async function act(a){await fetch('/api/'+a,{method:'POST'});refresh()}
+const TELEOP_CFG_KEYS=[
+ 'teleop_l_forward_m','teleop_l_yaw','teleop_l_rotation_duration_s','teleop_l_forward_duration_s',
+ 'teleop_auto_l_on_grip_s','home_lift_joint','home_arm_joint1','home_arm_joint4','home_head_joint1',
+ 'grasp_diff_threshold','gripper_close_threshold','gripper_l_stiffness','gripper_l_damping'
+];
+function teleopConfigBody(){
+ const body={};
+ TELEOP_CFG_KEYS.forEach(k=>{
+  const el=document.getElementById('cfg_'+k);
+  body[k]=el?el.value.trim():'';
+ });
+ return body;
+}
+async function saveTeleopConfig(){
+ const r=await fetch('/api/set_teleop_config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(teleopConfigBody())});
+ const j=await r.json();
+ if(!j.ok&&j.msg){alert(j.msg)}
+ refresh();
+}
+async function clearTeleopConfig(){
+ TELEOP_CFG_KEYS.forEach(k=>{const el=document.getElementById('cfg_'+k);if(el)el.value='';});
+ await saveTeleopConfig();
+}
+function fillTeleopConfig(d){
+ const cfg=d.teleop_config||{};
+ TELEOP_CFG_KEYS.forEach(k=>{
+  const el=document.getElementById('cfg_'+k);
+  if(!el||document.activeElement===el) return;
+  el.value=cfg[k]!=null?cfg[k]:'';
+ });
+}
+async function act(a){
+ if(a==='launch_record'||a==='launch_recorder') await saveTeleopConfig();
+ await fetch('/api/'+a,{method:'POST'});
+ refresh();
+}
 async function pipe(step){
  const r=await fetch('/api/pipeline/'+step,{method:'POST'});
+ const j=await r.json();
+ if(!j.ok&&j.msg){alert(j.msg)}
+ refresh();
+}
+async function lerobotV3(preferMixed){
+ const r=await fetch('/api/lerobot_v3',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prefer_mixed:!!preferMixed})});
+ const j=await r.json();
+ if(!j.ok&&j.msg){alert(j.msg)}
+ refresh();
+}
+async function runMerge(){
+ const rr=parseFloat(document.getElementById('raw_ratio').value);
+ const gr=parseFloat(document.getElementById('generate_ratio').value);
+ const r=await fetch('/api/merge',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({raw_ratio:rr,generate_ratio:gr})});
+ const j=await r.json();
+ if(!j.ok&&j.msg){alert(j.msg)}
+ refresh();
+}
+async function lerobotMixed(){
+ const r=await fetch('/api/lerobot_mixed',{method:'POST'});
  const j=await r.json();
  if(!j.ok&&j.msg){alert(j.msg)}
  refresh();
@@ -852,6 +1252,42 @@ function renderPipelineButtons(d){
    ' <span class="tag '+cls+'">'+st+miss+'</span></button>';
  }).join('');
 }
+function renderLerobotV3(d){
+ const el=document.getElementById('lerobot_v3_status');
+ if(!el)return;
+ const x=(d.experimental&&d.experimental.lerobot_v3)||{};
+ const p=(d.pipeline&&d.pipeline.paths)||{};
+ el.textContent=
+  'status: '+(x.status||'stopped')+
+  ' | venv: '+(x.venv_ready?'ready':'missing')+
+  ' | joint: '+(x.joint_ready?'yes':'no')+
+  ' | mixed: '+(x.mixed_ready?'yes':'no')+
+  '\njoint: '+(p.joint||'')+
+  '\nmixed: '+(p.mixed||'')+
+  '\nout: '+REPO_HINT;
+}
+function renderMerge(d){
+ const el=document.getElementById('merge_status');
+ if(!el)return;
+ const m=(d.experimental&&d.experimental.merge)||{};
+ const lm=(d.experimental&&d.experimental.lerobot_mixed)||{};
+ const p=(d.pipeline&&d.pipeline.paths)||{};
+ const rr=document.getElementById('raw_ratio');
+ const gr=document.getElementById('generate_ratio');
+ if(rr&&document.activeElement!==rr&&m.raw_ratio!=null) rr.value=m.raw_ratio;
+ if(gr&&document.activeElement!==gr&&m.generate_ratio!=null) gr.value=m.generate_ratio;
+ el.textContent=
+  'merge: '+(m.status||'stopped')+
+  ' | lerobot_mixed: '+(lm.status||'stopped')+
+  ' | raw: '+(m.raw_ready?'yes':'no')+
+  ' | joint: '+(m.joint_ready?'yes':'no')+
+  ' | mixed: '+(m.mixed_ready?'yes':'no')+
+  ' | ratios raw/gen='+(m.raw_ratio)+'/'+(m.generate_ratio)+
+  '\nraw: '+(p.raw||'')+
+  '\njoint: '+(p.joint||'')+
+  '\nmixed: '+(p.mixed||'');
+}
+const REPO_HINT='/workspace/cyclo_lab/datasets/lerobot_v3/<timestamp>';
 async function setTask(){
  const label=document.getElementById('task').value;
  await fetch('/api/set_task',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({task:label})});
@@ -925,6 +1361,9 @@ async function refresh(){
    'raw: '+p.raw+'\nik: '+p.ik+'\nannotate: '+p.annotate+'\ngenerate: '+p.generate+'\njoint: '+p.joint+
    '\nmimic: '+d.pipeline.mimic_id+' | trials: '+d.pipeline.generation_num_trials+' | envs: '+d.pipeline.num_envs;
  }
+ renderLerobotV3(d);
+ renderMerge(d);
+ fillTeleopConfig(d);
 }
 refresh();setInterval(refresh,3000);
 </script></body></html>"""
@@ -991,6 +1430,40 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg = kill_pipeline()
             self._json(200, {"ok": ok, "msg": msg})
             return
+        if path == "/api/lerobot_v3":
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                body = {}
+            ok, msg = launch_lerobot_v3(prefer_mixed=bool(body.get("prefer_mixed")))
+            self._json(200, {"ok": ok, "msg": msg})
+            return
+        if path == "/api/kill_lerobot_v3":
+            ok, msg = kill_lerobot_v3()
+            self._json(200, {"ok": ok, "msg": msg})
+            return
+        if path == "/api/merge":
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                body = {}
+            ok, msg = launch_merge(
+                raw_ratio=body.get("raw_ratio"),
+                generate_ratio=body.get("generate_ratio"),
+                seed=body.get("seed"),
+            )
+            self._json(200, {"ok": ok, "msg": msg})
+            return
+        if path == "/api/kill_merge":
+            ok, msg = kill_merge()
+            self._json(200, {"ok": ok, "msg": msg})
+            return
+        if path == "/api/lerobot_mixed":
+            ok, msg = launch_lerobot_from_mixed()
+            self._json(200, {"ok": ok, "msg": msg})
+            return
         if path == "/api/set_task":
             length = int(self.headers.get("Content-Length", "0") or "0")
             try:
@@ -1017,6 +1490,17 @@ class Handler(BaseHTTPRequestHandler):
                 body = {}
             _set_auto_success(bool(body.get("auto_success", False)))
             self._json(200, {"ok": True, "auto_success": _auto_success})
+            return
+        if path == "/api/set_teleop_config":
+            length = int(self.headers.get("Content-Length", "0") or "0")
+            try:
+                body = json.loads(self.rfile.read(length) or b"{}")
+            except Exception:
+                body = {}
+            if not isinstance(body, dict):
+                body = {}
+            cfg = _set_teleop_config(body)
+            self._json(200, {"ok": True, "teleop_config": cfg})
             return
         self._json(404, {"error": "not found"})
 

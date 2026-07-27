@@ -155,7 +155,9 @@
                     "right_eef_pose"
                 ],
                 "rgb": [
-                    "cam_head"
+                    "cam_head",
+                    "cam_wrist_left",
+                    "cam_wrist_right"
                 ],
                 "depth": [],
                 "scan": []
