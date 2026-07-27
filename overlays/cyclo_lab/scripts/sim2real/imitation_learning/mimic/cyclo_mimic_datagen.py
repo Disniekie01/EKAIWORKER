@@ -195,6 +195,16 @@ class CycloDataGenInfoPool(DataGenInfoPool):
 
     def _add_episode(self, episode):
         super()._add_episode(episode)
+        # Retained source episodes are used only for state/action replay (L-motion,
+        # lift/head). Recorded camera images are never read by datagen (cameras are
+        # re-rendered during generation), so drop them here to avoid GPU OOM when many
+        # source demos are loaded. datagen_info / joint_pos obs are kept.
+        obs = episode.data.get("obs")
+        if isinstance(obs, dict):
+            for key in list(obs.keys()):
+                k = key.lower()
+                if "cam" in k or "image" in k or "rgb" in k:
+                    del obs[key]
         self.episodes.append(episode)
         self.episode_body_joints.append(body_joint_cmds_from_episode(episode))
 
@@ -480,6 +490,13 @@ async def cyclo_multi_waypoint_execute(
             env._mimic_recorded_state = (recorded_episode, recorded_state_index)
         if hasattr(env, "_mimic_carry_latch"):
             env._mimic_carry_latch = recorded_carry_latch
+        # Per-env slots for the multi-env datagen path (num_envs > 1).
+        if hasattr(env, "_mimic_recorded_states"):
+            env._mimic_recorded_states[env_id] = (recorded_episode, recorded_state_index)
+            if recorded_carry_latch:
+                env._mimic_carry_latch_envs.add(env_id)
+            else:
+                env._mimic_carry_latch_envs.discard(env_id)
 
     if "action_noise_dict" in inspect.signature(env.target_eef_pose_to_action).parameters:
         action_noise_dict = {eef_name: waypoint.noise for eef_name, waypoint in self.waypoints.items()}
