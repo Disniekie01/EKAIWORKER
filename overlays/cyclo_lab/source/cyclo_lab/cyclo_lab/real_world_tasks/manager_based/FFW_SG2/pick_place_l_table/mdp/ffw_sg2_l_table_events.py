@@ -140,3 +140,25 @@ def is_object_on_left_table_top(
     target_z = TABLE_HEIGHT + BOX_HALF_HEIGHT
     z_ok = torch.abs(rel_local[:, 2] - target_z) < height_tolerance
     return torch.logical_and(xy_ok, z_ok)
+
+
+def reset_mobile_base_standing(
+    env: ManagerBasedEnv,
+    env_ids: torch.Tensor,
+    height: float,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> None:
+    """Lift the free base to its standing height after a scene reset.
+
+    ``reset_scene_to_default`` writes the root pose from ``default_root_state``, whose z is the
+    config init height (~0.01). But the USD places the base body ~1.43 m above that prim origin,
+    so a direct root write buries the wheels below the floor. This event teleports the base to
+    the correct world height (wheels just above the ground) with zero velocity. It must run
+    AFTER ``reset_scene_to_default``.
+    """
+    robot = env.scene[asset_cfg.name]
+    root_pose = robot.data.root_state_w[env_ids, :7].clone()
+    root_pose[:, 2] = height
+    robot.write_root_pose_to_sim(root_pose, env_ids=env_ids)
+    zero_vel = torch.zeros((len(env_ids), 6), device=env.device)
+    robot.write_root_velocity_to_sim(zero_vel, env_ids=env_ids)

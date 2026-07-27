@@ -48,7 +48,10 @@ class LTableSceneCfg(InteractiveSceneCfg):
     cardboard_box: AssetBaseCfg = MISSING
     box_riser: AssetBaseCfg = MISSING
     drop_zone_marker: AssetBaseCfg | None = None
+    # Real-robot parity cameras. ``cam_head`` is the ZED left eye (kept under its stock name
+    # so the ~50 other references still resolve); the converter exports it as cam_left_head.
     cam_head: CameraCfg = MISSING
+    cam_right_head: CameraCfg = MISSING
     cam_wrist_left: CameraCfg = MISSING
     cam_wrist_right: CameraCfg = MISSING
 
@@ -113,9 +116,15 @@ class ObservationsCfg:
             func=mdp.eef_pose,
             params={"eef_cfg": SceneEntityCfg("right_eef"), "robot_cfg": SceneEntityCfg("robot")},
         )
+        # Real-robot parity: ZED stereo head (left = cam_head) + a wrist camera per arm.
+        # These ObsTerm names become the HDF5 obs keys the LeRobot converter reads.
         cam_head = ObsTerm(
             func=mdp.image,
             params={"sensor_cfg": SceneEntityCfg("cam_head"), "data_type": "rgb", "normalize": False},
+        )
+        cam_right_head = ObsTerm(
+            func=mdp.image,
+            params={"sensor_cfg": SceneEntityCfg("cam_right_head"), "data_type": "rgb", "normalize": False},
         )
         cam_wrist_left = ObsTerm(
             func=mdp.image,
@@ -203,6 +212,10 @@ class PickPlaceLTableEnvCfg(ManagerBasedRLEnvCfg):
     teleop_l_target_label: str = "left table"
     teleop_l_use_swerve: bool = False
     teleop_auto_l_on_grip_s: float = 2.0
+    # Plan B: free base driving from /cmd_vel instead of the scripted L-motion.
+    # The mobile task variant sets this True (see FFWSG2PickPlaceLTableMobileEnvCfg).
+    teleop_base_drive: bool = False
+    teleop_cmd_vel_topic: str = "/cmd_vel"
     # Optional swerve L-motion limits (used only when teleop_l_use_swerve=True).
     teleop_l_swerve_yaw_tol: float = 0.08
     teleop_l_swerve_max_angular_z: float = 0.6

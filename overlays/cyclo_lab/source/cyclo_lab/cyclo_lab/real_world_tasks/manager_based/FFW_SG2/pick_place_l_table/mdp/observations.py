@@ -72,3 +72,19 @@ def object_on_left_table(
     return is_object_on_left_table_top(
         env, object_cfg, table_left_cfg, edge_margin=edge_margin, height_tolerance=height_tolerance
     )
+
+
+def base_planar_velocity(
+    env: ManagerBasedRLEnv,
+    asset_cfg: SceneEntityCfg = SceneEntityCfg("robot"),
+) -> torch.Tensor:
+    """Base planar velocity in the base frame: ``[linear_x, linear_y, angular_z]``.
+
+    Matches the real ffw_sg2_rev1 base-velocity convention appended to the 19-joint state
+    (state/action dims 19 -> 22). Only meaningful on the drivable base (FFW_SG2_MOBILE);
+    on the welded stock base it stays ~0.
+    """
+    asset: Articulation = env.scene[asset_cfg.name]
+    lin_b = asset.data.root_lin_vel_b  # (num_envs, 3) linear velocity, base frame
+    ang_b = asset.data.root_ang_vel_b  # (num_envs, 3) angular velocity, base frame
+    return torch.cat([lin_b[:, :2], ang_b[:, 2:3]], dim=-1)
