@@ -371,21 +371,63 @@ def _state_to_device(state: dict, device: torch.device) -> dict:
     return output
 
 
-def _apply_recorded_step_state(env: ManagerBasedRLMimicEnv, episode: EpisodeData, state_index: int) -> bool:
-    """Apply a recorded post-step scene state (robot base, box, joints, etc.).
+def _apply_recorded_step_state(
+    env: ManagerBasedRLMimicEnv,
+    episode: EpisodeData,
+    state_index: int,
+    *,
+    skip_robot_joints: bool = True,
+) -> bool:
+    """Apply a recorded post-step scene state (robot base, box, etc.).
 
     VR L-table demos record kinematic L-motion outside the action vector. Replaying IK
-    arm commands alone leaves the base at its spawn pose; restoring recorded states after
-    each step keeps annotate aligned with the teleop trajectory.
+    arm commands alone leaves the base at its spawn pose; restoring recorded root/object
+    states after each step keeps annotate aligned with the teleop trajectory.
+
+    When ``skip_robot_joints`` is True (default for mimic_ik annotate), pin joints to
+    the live DiffIK pose instead of recorded joint_position. Restoring recorded joints
+    after a Differential-IK ``env.step`` fights the IK solution every frame (null-space
+    drift → joint snap = arm jitter). Raw joint replay should pass ``skip_robot_joints=False``.
     """
     step_state = episode.get_state(state_index)
     if step_state is None:
         return False
     step_state = _state_to_device(step_state, env.device)
+    if skip_robot_joints:
+        step_state = _with_live_robot_joints(env, step_state)
     # Use scene.reset_to directly so we do not trigger recorder pre/post-reset hooks.
     env.scene.reset_to(step_state, env_ids=None, is_relative=True)
     env.sim.forward()
     return True
+
+
+def _with_live_robot_joints(env, state: dict) -> dict:
+    """Pin robot joints to live values so scene.reset_to is a no-op on arms.
+
+    ``InteractiveScene.reset_to`` always writes joint_position/joint_velocity.
+    Dropping those keys raises KeyError / can hang. Instead overwrite them with
+    the current articulation joint state while still restoring root pose and
+    rigid objects (needed for L-table base / box replay).
+    """
+    artic = state.get("articulation")
+    if not isinstance(artic, dict) or "robot" not in artic:
+        return state
+    robot = artic["robot"]
+    if not isinstance(robot, dict):
+        return state
+    robot_asset = env.scene["robot"]
+    live_robot = {
+        **robot,
+        "joint_position": robot_asset.data.joint_pos.clone(),
+        "joint_velocity": robot_asset.data.joint_vel.clone(),
+    }
+    return {
+        **state,
+        "articulation": {
+            **artic,
+            "robot": live_robot,
+        },
+    }
 
 
 def replay_episode(

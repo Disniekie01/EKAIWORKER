@@ -31,8 +31,33 @@ from isaaclab_mimic.datagen.data_generator import DataGenerator
 from isaaclab_mimic.datagen.datagen_info_pool import DataGenInfoPool
 from isaaclab_mimic.datagen.waypoint import MultiWaypoint, Waypoint, WaypointSequence, WaypointTrajectory
 
-# Record / replay layout (ActionManager order): lift@16, head1@17, head2@18.
-_ACT_BODY = slice(16, 19)
+# ---------------------------------------------------------------------------
+# SG2 layout contract (verify against datasets / ActionManager):
+#
+#   ActionManager / RAW record actions (19):
+#       [..., lift_joint(16), head_joint1(17), head_joint2(18)]
+#
+#   Observation joint_pos / joint_pos_target (19):
+#       [..., head_joint1(16), lift_joint(17), head_joint2(18)]
+#
+#   IK-converted actions (19) from action_data_converter (current):
+#       [..., lift_joint(16), head_joint1(17), head_joint2(18)]  (= AM order)
+#
+#   Legacy IK convert (older HDF5s) used:
+#       [..., head_joint1(16), head_joint2(17), lift_joint(18)]
+#
+# Body cmds injected during datagen MUST be ActionManager order:
+#       [lift, head1, head2]  →  slots 16, 17, 18
+# ---------------------------------------------------------------------------
+_ACT_LIFT = 16
+_ACT_HEAD1 = 17
+_ACT_HEAD2 = 18
+_IK_HEAD1 = 16
+_IK_HEAD2 = 17
+_IK_LIFT = 18
+_OBS_HEAD1 = 16
+_OBS_LIFT = 17
+_OBS_HEAD2 = 18
 
 # Fallback when recorded lift channel is flat in both actions and obs.
 _SCRIPT_LIFT_START = 0.0365
@@ -41,16 +66,65 @@ _SCRIPT_LIFT_RAMP_STEPS = 40
 _SCRIPT_LIFT_MIN_STD = 1e-3
 
 
+def actions_are_ik_layout(actions: torch.Tensor) -> bool:
+    """True for *legacy* IK trailing order [head1, head2, lift] (not AM [lift, head1, head2]).
+
+    Current joint→IK convert emits AM trailing order; older HDF5s used head-then-lift.
+    On L-table demos head_joint1 mean is typically well above lift mean, so
+    ``actions[:, 16].mean() > actions[:, 18].mean()`` implies the legacy IK layout.
+    """
+    if actions.ndim != 2 or actions.shape[1] < 19:
+        return False
+    return float(actions[:, _IK_HEAD1].mean().item()) > float(actions[:, _IK_LIFT].mean().item())
+
+
 def body_joint_cmds_from_actions(actions: torch.Tensor) -> torch.Tensor:
-    """Return per-step [lift, head1, head2] from recorded actions (record replay layout)."""
-    return actions[:, _ACT_BODY].clone()
+    """Return per-step [lift, head1, head2] for ActionManager injection.
+
+    Accepts both RAW/AM joint actions and IK-converted actions.
+    """
+    if actions.ndim != 2 or actions.shape[1] < 19:
+        raise ValueError(
+            f"Episode actions need >=19 dims for lift/head replay, got "
+            f"{None if actions.ndim < 2 else actions.shape[1]}"
+        )
+    if actions_are_ik_layout(actions):
+        # IK convert: [..., head1, head2, lift] → [lift, head1, head2]
+        return torch.cat(
+            [
+                actions[:, _IK_LIFT : _IK_LIFT + 1],
+                actions[:, _IK_HEAD1 : _IK_HEAD2 + 1],
+            ],
+            dim=1,
+        )
+    # ActionManager / RAW: already [..., lift, head1, head2]
+    return actions[:, _ACT_LIFT : _ACT_HEAD2 + 1].clone()
 
 
 def body_joint_cmds_from_joint_pos(joint_pos: torch.Tensor) -> torch.Tensor:
-    """Fallback: map obs joint layout (head1, lift, head2) to action layout (lift, head)."""
-    lift = joint_pos[:, 17:18]
-    head = joint_pos[:, [16, 18]]
+    """Map obs joint layout [..., head1, lift, head2] → [lift, head1, head2]."""
+    lift = joint_pos[:, _OBS_LIFT : _OBS_LIFT + 1]
+    head = joint_pos[:, [_OBS_HEAD1, _OBS_HEAD2]]
     return torch.cat([lift, head], dim=1)
+
+
+def body_joint_cmds_from_episode(episode: EpisodeData) -> torch.Tensor:
+    """Extract [lift, head1, head2], preferring unambiguous obs joint order when present."""
+    obs = episode.data.get("obs")
+    if isinstance(obs, dict):
+        for key in ("joint_pos_target", "joint_pos"):
+            if key in obs:
+                joint_data = obs[key]
+                if isinstance(joint_data, torch.Tensor) and joint_data.ndim == 2 and joint_data.shape[1] >= 19:
+                    return body_joint_cmds_from_joint_pos(joint_data)
+
+    if "actions" in episode.data:
+        actions = episode.data["actions"]
+        if not isinstance(actions, torch.Tensor):
+            actions = torch.as_tensor(actions)
+        return body_joint_cmds_from_actions(actions)
+
+    raise ValueError("Episode lacks actions or obs/joint_pos(_target) for VR lift/head replay")
 
 
 def _script_lift_approach(body_joint_cmds: torch.Tensor) -> torch.Tensor:
@@ -122,24 +196,7 @@ class CycloDataGenInfoPool(DataGenInfoPool):
     def _add_episode(self, episode):
         super()._add_episode(episode)
         self.episodes.append(episode)
-
-        if "actions" in episode.data:
-            actions = episode.data["actions"]
-            if actions.shape[1] < 19:
-                raise ValueError(
-                    f"Episode actions need >=19 dims for lift/head replay, got {actions.shape[1]}"
-                )
-            self.episode_body_joints.append(body_joint_cmds_from_actions(actions))
-            return
-
-        obs = episode.data["obs"]
-        if "joint_pos_target" in obs:
-            joint_data = obs["joint_pos_target"]
-        elif "joint_pos" in obs:
-            joint_data = obs["joint_pos"]
-        else:
-            raise ValueError("Episode lacks actions or obs/joint_pos(_target) for VR lift replay")
-        self.episode_body_joints.append(body_joint_cmds_from_joint_pos(joint_data))
+        self.episode_body_joints.append(body_joint_cmds_from_episode(episode))
 
 
 def _spread_waypoint_cmds(waypoints: list, per_step_cmds, attr: str) -> None:

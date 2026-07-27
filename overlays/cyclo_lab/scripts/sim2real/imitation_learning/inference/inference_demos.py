@@ -130,6 +130,7 @@ def main():
                 print("[INFO] Reset requested.")
                 should_reset_task = False
                 env.reset()
+                teleop_interface.reset()
                 continue
 
             elif actions is None:

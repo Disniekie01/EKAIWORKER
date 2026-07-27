@@ -346,6 +346,77 @@ python scripts/sim2real/imitation_learning/inference/inference_demos.py --task C
 
 ```
 
+### FFW-SG2 L-table Robomimic Play Notes
+
+For `Cyclo-Real-Pick-Place-LTable-FFW-SG2-v0`, the play script supports a hybrid mode:
+- policy controls arm/gripper/head/lift actions
+- scripted base `L` movement runs after grasp latch
+
+```bash
+python scripts/imitation_learning/robomimic/play.py \
+  --device cuda \
+  --task Cyclo-Real-Pick-Place-LTable-FFW-SG2-v0 \
+  --checkpoint /PATH/TO/model_epoch_20.pth \
+  --num_rollouts 10 --horizon 2000 \
+  --enable_cameras --action_mode inference \
+  --scripted_l_motion
+```
+
+Key flags:
+- `--scripted_l_motion`: enable scripted base rotate+forward `L` motion during play
+- `--action_mode inference`: initializes action terms required by real-world SG2 envs
+- `--remap_ffw_sg2_actions` / `--no_remap_ffw_sg2_actions`: control SG2 head/lift action index remapping
+
+## Experimental / Recent fixes (SG2 L-table)
+
+Work on this branch covers SG2 L-table imitation-learning fixes (issues 2–8), dashboard knobs, and optional experimental tools. Default Mimic pipeline steps are unchanged unless noted.
+
+**Dashboard layout** (`sg2_ltable_dashboard.py`): **Config — L-motion / home / grasp** sits after Recording. **Merge datasets** and **LeRobot v3.0 export** (both Experimental) sit below the Mimic pipeline card.
+
+**New training env:** see [docs/CREATE_TRAINING_ENV.md](docs/CREATE_TRAINING_ENV.md).
+
+### Issue 2 — Head/lift action mapping
+
+- **Problem:** Trailing action order for `lift` / `head1` / `head2` disagreed between AM, observations, and IK conversion, corrupting Mimic datagen and replay.
+- **Fix:** Aligned trailing order to `lift`, `head1`, `head2` in datagen and converters; added a mapping verifier.
+- **Where to edit:** `scripts/sim2real/imitation_learning/mimic/cyclo_mimic_datagen.py`, `action_data_converter.py`, `verify_sg2_action_mapping.py` (smoke: `smoke_sg2_lift_mapping.py`).
+
+### Issue 3 — Dual wrist cameras
+
+- **Problem:** L-table IL needed left/right wrist RGB in the scene, LeRobot export, DDS publish, and robomimic configs.
+- **Fix:** Added `cam_wrist_left` / `cam_wrist_right` to scene/obs, discovery, DDS, and robomimic JSON; tuned wrist camera poses.
+- **Where to edit:** `.../pick_place_l_table/joint_pos_env_cfg.py` (poses), obs terms in `pick_place_env_cfg.py`, `isaaclab2lerobot.py`, `ffw_sg2_sdk.py`, `agents/robomimic/bc_rnn_image.json` (smoke: `smoke_sg2_wrist_cams.py`).
+
+### Issue 4 — Arm jitter (IK / annotate / datagen)
+
+- **Problem:** `reset_to` fought DiffIK, and quaternion double-cover caused discontinuous arm targets / visible jitter.
+- **Fix:** Prefer live robot joints via `_with_live_robot_joints`; enforce quat continuity across resets/replays.
+- **Where to edit:** Mimic env / datagen / annotate paths under `.../mimic/` and `pick_place*_mimic_env.py`; validators `verify_sg2_arm_jitter.py`, `smoke_sg2_arm_jitter.py`.
+
+### Issue 5 — Raw + generated merge (Experimental)
+
+- **Problem:** Wanted a mixed dataset (human raw + Mimic joint) without altering the default Mimic chain.
+- **Fix:** Standalone CLI `merge_joint_datasets.py` and dashboard **Merge datasets (Experimental)** → `*_mixed.hdf5`. Does **not** change default pipeline outputs.
+- **Where to edit:** `scripts/sim2real/imitation_learning/mimic/merge_joint_datasets.py`, `sg2_ltable_dashboard.py` (smoke: `smoke_sg2_merge_datasets.py`).
+
+### Issue 6 — LeRobot format 3.0 (Experimental)
+
+- **Problem:** Optional export to LeRobot dataset format 3.0 alongside default v2.1.
+- **Fix:** `--dataset_format {v2,v3}` on `isaaclab2lerobot.py`; `setup_lerobot_v3_env.sh`; dashboard **LeRobot v3.0 export (Experimental)**. Live smoke passed 14/14. Needs `lerobot_env_v3` with pinned `av>=12,<16`.
+- **Where to edit:** `scripts/sim2real/imitation_learning/data_converter/isaaclab2lerobot.py`, `setup_lerobot_v3_env.sh`, dashboard experimental card (smoke: `smoke_sg2_lerobot_v3.py`).
+
+### Issue 7 — Swerve / wheel physics (future)
+
+- **Problem:** Physics-based swerve wheels vs kinematic root teleport for L-motion.
+- **Fix:** Deferred. Kinematic root teleport remains the default (`teleop_l_use_swerve=False`).
+- **Where to edit / read:** [docs/FUTURE_FIX_swerve_wheel_physics.md](docs/FUTURE_FIX_swerve_wheel_physics.md); L-motion in `ltable_kinematic_l_motion.py` and `ffw_sg2_sdk.py`.
+
+### Issue 8 — Config of hardcoded motions/params
+
+- **Problem:** L-yaw, forward distance, durations, home lift/pose, grasp thresholds, soft-grip / optional gripper PD lived as hardcodes.
+- **Fix:** Fields on `PickPlaceLTableEnvCfg` + `sync_configured_params()`; `record_demos.py` CLI flags; dashboard Config card with shell-env fallback.
+- **Where to edit:** `.../pick_place_l_table/pick_place_env_cfg.py`, `record_demos.py`, `sg2_ltable_dashboard.py` (smoke: `smoke_sg2_teleop_cfg.py`). Prefer env-cfg knobs for new tasks — see the [training env guide](docs/CREATE_TRAINING_ENV.md).
+
 ## License
 
 This repository is licensed under the **Apache 2.0 License**. See [LICENSE](LICENSE) for details.

@@ -215,19 +215,34 @@ class FFWSH5Sdk(FFWSG2Sdk):
             pass
         super()._on_press(key)
 
-    def _request_pose_reset(self):
+    def _clear_teleop_command_state(self) -> None:
+        """Clear SG2 caches plus SH5 hand/lift keyboard leftovers."""
+        super()._clear_teleop_command_state()
         self._lift_keyboard_cmd = None
-        with self.lock:
-            if self.lift_joint_trajectory_cmd is not None:
-                self.lift_joint_trajectory_cmd.pop("lift_joint", None)
-        super()._request_pose_reset()
+        self.left_hand_trajectory_cmd = None
+        self.right_hand_trajectory_cmd = None
 
-    def reset(self):
-        self._lift_keyboard_cmd = None
-        with self.lock:
-            if self.lift_joint_trajectory_cmd is not None:
-                self.lift_joint_trajectory_cmd.pop("lift_joint", None)
-        super().reset()
+    def _hand_subscriber_loop(self, reader, attr_name: str, label: str) -> None:
+        try:
+            while self.running:
+                for msg in reader.take_iter():
+                    if msg and msg.points:
+                        joint_dict = dict(zip(msg.joint_names, msg.points[-1].positions))
+                        with self.lock:
+                            if not self._accept_teleop_cmds:
+                                continue
+                            current = getattr(self, attr_name) or {}
+                            current.update(joint_dict)
+                            setattr(self, attr_name, current)
+                time.sleep(0.001)
+        except Exception as e:
+            print(f"{label} hand subscriber thread exception:", e)
+        finally:
+            try:
+                reader.Close()
+            except Exception as e:
+                print(f"Error closing {label} hand subscriber: {e}")
+            print(f"{label} hand subscriber closed")
 
     def _resolve_action_joint_order(self) -> list:
         """Build the flat joint-name order the ActionManager actually applies.
@@ -250,26 +265,6 @@ class FFWSH5Sdk(FFWSG2Sdk):
         except Exception as exc:  # pragma: no cover - defensive
             print(f"[SH5] WARNING: falling back to static joint order ({exc}).")
             return list(SH5_POLICY_JOINT_NAMES)
-
-    def _hand_subscriber_loop(self, reader, attr_name: str, label: str) -> None:
-        try:
-            while self.running:
-                for msg in reader.take_iter():
-                    if msg and msg.points:
-                        joint_dict = dict(zip(msg.joint_names, msg.points[-1].positions))
-                        with self.lock:
-                            current = getattr(self, attr_name) or {}
-                            current.update(joint_dict)
-                            setattr(self, attr_name, current)
-                time.sleep(0.001)
-        except Exception as e:
-            print(f"{label} hand subscriber thread exception:", e)
-        finally:
-            try:
-                reader.Close()
-            except Exception as e:
-                print(f"Error closing {label} hand subscriber: {e}")
-            print(f"{label} hand subscriber closed")
 
     def _left_hand_subscriber_loop(self):
         self._hand_subscriber_loop(
