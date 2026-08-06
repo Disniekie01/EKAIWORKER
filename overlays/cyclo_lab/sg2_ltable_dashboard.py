@@ -618,7 +618,7 @@ USE_SESSION_NAMING = True
 # filename stage token: {HHMM}_{base}_{token}.hdf5  (internal key -> file token)
 _STAGE_FILE_TOKEN = {
     "raw": "raw", "ik": "ik", "annotate": "annotate",
-    "generate": "gen", "joint": "joint",
+    "generate": "gen", "joint": "joint", "mixed": "mixed",
 }
 
 # Active recording session, set when a recorder is launched:
@@ -703,7 +703,7 @@ def _pipeline_paths(task: dict[str, str]) -> dict[str, str]:
         session = _active_session or _latest_session(task)
         if session is not None:
             return {stage: _session_file(task, session, stage)
-                    for stage in ("raw", "ik", "annotate", "generate", "joint")}
+                    for stage in ("raw", "ik", "annotate", "generate", "joint", "mixed")}
         _log("pipeline", "no recorded session found; falling back to legacy flat naming")
 
     # --- legacy flat naming (original behavior) ---
