@@ -1,0 +1,25 @@
+# LeRobot track — key pinned versions (verified from the working cyclo-lab venv, 2026-07).
+# Python 3.12.3. Install torch/torchvision from the CUDA 12.8 index (see 01_setup.md);
+# they are listed here for reference only.
+#
+# lerobot itself is installed from source, pinned by commit:
+#   lerobot[training,av-dep] @ git+https://github.com/ROBOTIS-GIT/lerobot-cyclo.git@2e9cd87bbdb93c23503f7eeca7317bd33027b279
+#
+# The complete frozen environment is in requirements-full.txt.
+
+torch==2.7.1              # +cu128, from https://download.pytorch.org/whl/cu128
+torchvision==0.22.1       # +cu128
+torchcodec==0.5
+numpy==2.2.6
+diffusers==0.38.0
+accelerate==1.14.0
+datasets==4.8.5
+huggingface_hub==1.21.0
+gymnasium==1.3.0
+av==15.1.0
+opencv-python-headless==4.13.0.92
+einops==0.8.2
+draccus==0.10.0
+optuna==4.9.0
+wandb==0.24.2
+h5py==3.16.0
